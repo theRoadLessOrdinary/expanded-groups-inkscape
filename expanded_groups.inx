@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
+
+	<name>Browse Groups...</name>
+	<id>trlo.expanded_groups</id>
+
+	<effect>
+		<object-type>all</object-type>
+		<effects-menu>
+			<submenu name="Expanded Groups"/>
+		</effects-menu>
+	</effect>
+
+	<script>
+		<command location="inx" interpreter="python">expanded_groups.py</command>
+	</script>
+
+</inkscape-extension>
