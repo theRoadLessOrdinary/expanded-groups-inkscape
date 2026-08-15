@@ -19,7 +19,7 @@ import tempfile
 
 from expanded_groups_data import scan_groups_by_id
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 
 def spawn_detached(argv):

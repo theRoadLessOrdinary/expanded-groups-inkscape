@@ -28,9 +28,9 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 
 from expanded_groups_data import GROUP_ATTR, merge_names
-from expanded_groups_dbus import select_by_id_live, set_attribute_live
+from expanded_groups_dbus import select_by_id_live, set_attribute_live, quiet_stderr
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 
 class ExpandedGroupsPanel:
@@ -41,6 +41,13 @@ class ExpandedGroupsPanel:
         self.build_dialog()
 
     def build_dialog(self):
+        # Redundant when launched detached (its stderr is already devnull'd
+        # before exec), but kept consistent/safe if this script is ever run
+        # directly for debugging. See quiet_stderr()'s docstring.
+        with quiet_stderr():
+            self._build_dialog_inner()
+
+    def _build_dialog_inner(self):
         win = Gtk.Window(title=f"Expanded Groups v{VERSION}")
         win.set_default_size(340, 420)
         win.set_border_width(10)

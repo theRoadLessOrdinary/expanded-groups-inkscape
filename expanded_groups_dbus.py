@@ -11,8 +11,20 @@ extension does. For assign_group.py, that stderr output reaches Inkscape
 Inkscape's "script produced additional output" dialog on every single
 Assign click. The warning is suppressed here at the import site so it
 never reaches stderr in the first place.
+
+Separately, actually creating the first GTK window/dialog in a process
+(not just importing gi) triggers GLib's own C-level log messages --
+"Gtk-Message: Failed to load module 'colorreload-gtk-module'" and similar,
+from Flatpak's sandboxed GTK trying and failing to load theme-integration
+modules. This is GLib writing straight to file descriptor 2, not through
+Python's warnings/logging machinery at all, so warnings.filterwarnings
+can't touch it. quiet_stderr() below handles this the only way that
+actually works: temporarily redirecting the real OS-level stderr fd.
 """
 
+import contextlib
+import os
+import sys
 import warnings
 warnings.filterwarnings('ignore')  # must precede the gi import below
 
@@ -20,6 +32,28 @@ import inkex
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gio, GLib
+
+
+@contextlib.contextmanager
+def quiet_stderr():
+    """
+    Temporarily redirect the real OS-level stderr (fd 2) to /dev/null.
+    Wrap any GTK window/dialog creation in this -- Inkscape treats ANY
+    stderr output from an effect script as reason to show its own "script
+    produced additional output" dialog, and dismissing that dialog was
+    found to reset whatever canvas selection had just been made live, so
+    this isn't just cosmetic.
+    """
+    stderr_fd = sys.stderr.fileno()
+    saved_fd = os.dup(stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(devnull_fd)
+        os.close(saved_fd)
 
 # Inkscape exposes its own action system (the same actions the Extensions/
 # Edit menus call) over the session D-Bus bus as a standard GApplication

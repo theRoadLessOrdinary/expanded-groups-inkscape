@@ -16,6 +16,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 
 from expanded_groups_data import GROUP_SEP, add_group_name
+from expanded_groups_dbus import quiet_stderr
 
 
 class AssignGroup(inkex.EffectExtension):
@@ -42,24 +43,29 @@ class AssignGroup(inkex.EffectExtension):
             add_group_name(node, name)
 
     def prompt_for_name(self):
-        dialog = Gtk.Dialog(title="Assign To Expanded Group")
-        dialog.set_modal(True)
-        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("_OK", Gtk.ResponseType.OK)
-        dialog.set_default_response(Gtk.ResponseType.OK)
+        # Creating/showing the first GTK window in this process is what
+        # triggers GLib's "Failed to load module ..." messages on stderr
+        # (Flatpak's sandboxed GTK missing theme-integration modules) --
+        # not the gi import itself. See quiet_stderr()'s docstring.
+        with quiet_stderr():
+            dialog = Gtk.Dialog(title="Assign To Expanded Group")
+            dialog.set_modal(True)
+            dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+            dialog.add_button("_OK", Gtk.ResponseType.OK)
+            dialog.set_default_response(Gtk.ResponseType.OK)
 
-        box = dialog.get_content_area()
-        box.set_border_width(10)
-        box.set_spacing(6)
-        box.add(Gtk.Label(label="Group name:", xalign=0))
-        entry = Gtk.Entry()
-        entry.set_activates_default(True)
-        box.add(entry)
-        dialog.show_all()
+            box = dialog.get_content_area()
+            box.set_border_width(10)
+            box.set_spacing(6)
+            box.add(Gtk.Label(label="Group name:", xalign=0))
+            entry = Gtk.Entry()
+            entry.set_activates_default(True)
+            box.add(entry)
+            dialog.show_all()
 
-        response = dialog.run()
-        text = entry.get_text().strip()
-        dialog.destroy()
+            response = dialog.run()
+            text = entry.get_text().strip()
+            dialog.destroy()
 
         if response != Gtk.ResponseType.OK:
             return None
