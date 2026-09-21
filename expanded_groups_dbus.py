@@ -105,3 +105,34 @@ def set_attribute_live(attr_name, attr_value):
         inkex.errormsg(f"Could not set {attr_name} in the live Inkscape window: {e}")
         return False
     return True
+
+
+def run_extension_live(action_name):
+    """Run an installed extension in the live window, as if chosen from the
+    Extensions menu (e.g. 'trlo.assign-group.noprefs')."""
+    try:
+        _activate_live(action_name)
+    except GLib.Error as e:
+        inkex.errormsg(f"Could not run {action_name} in the live Inkscape window: {e}")
+        return False
+    return True
+
+
+def set_hidden_live(hidden):
+    """Hide/show whatever is selected in the live window (display style)."""
+    try:
+        _activate_live('object-set-property', f"display,{'none' if hidden else 'inline'}")
+    except GLib.Error as e:
+        inkex.errormsg(f"Could not change visibility in the live Inkscape window: {e}")
+        return False
+    return True
+
+
+def set_locked_live(locked):
+    """Lock/unlock whatever is selected in the live window."""
+    try:
+        _activate_live('selection-lock' if locked else 'selection-unlock')
+    except GLib.Error as e:
+        inkex.errormsg(f"Could not change lock in the live Inkscape window: {e}")
+        return False
+    return True

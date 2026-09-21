@@ -13,6 +13,8 @@ assign_group.py, which do need gi and so suppress the warning explicitly.
 """
 
 import inkex
+import os
+import tempfile
 
 # Arbitrary namespace identifier for this extension's own bookkeeping
 # attribute, following the same pattern Ink/Stitch uses for its own
@@ -96,3 +98,32 @@ def scan_groups_by_id(svg):
             by_name.setdefault(name, []).append(node_id)
 
     return by_name, by_id
+
+
+def scan_states(svg):
+    """{id: {'hidden': bool, 'locked': bool}} for every trlo:group node.
+    Only the node's own display/lock state, not inherited from ancestors."""
+    states = {}
+    for node in svg.xpath('//*[@trlo:group]', namespaces=inkex.NSS):
+        node_id = node.get('id')
+        if not node_id:
+            continue
+        display = node.style.get('display') if hasattr(node, 'style') else None
+        states[node_id] = {
+            'hidden': display == 'none',
+            'locked': node.get('sodipodi:insensitive') == 'true',
+        }
+    return states
+
+
+# assign_group.py records what it just did here so an open browse panel (a
+# separate, detached process with no way to query Inkscape) can update its
+# list after its Assign button triggers the extension.
+LAST_ASSIGN_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_last_assign.json')
+
+# The panel's "Add Selection to <group>" context-menu item writes the target
+# group name here (with a timestamp) right before running assign_group.py,
+# which then skips its name prompt. Ignored if older than PENDING_MAX_AGE
+# seconds, so a run that never happened can't hijack a later menu use.
+PENDING_TARGET_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_pending_target.json')
+PENDING_MAX_AGE = 30

@@ -17,7 +17,7 @@ import os
 import sys
 import tempfile
 
-from expanded_groups_data import scan_groups_by_id
+from expanded_groups_data import scan_groups_by_id, scan_states
 
 VERSION = "2.3.0"
 
@@ -67,7 +67,8 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
 
         fd, snapshot_path = tempfile.mkstemp(prefix='expanded_groups_', suffix='.json')
         with os.fdopen(fd, 'w') as f:
-            json.dump({'by_name': by_name, 'by_id': by_id}, f)
+            json.dump({'by_name': by_name, 'by_id': by_id,
+                       'states': scan_states(self.svg)}, f)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         panel_script = os.path.join(script_dir, 'expanded_groups_panel.py')

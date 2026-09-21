@@ -8,6 +8,9 @@ either of those, only the document Inkscape hands a normal effect script.
 """
 
 import inkex
+import json
+import os
+import time
 import warnings
 warnings.filterwarnings('ignore')  # before the gi import below
 
@@ -15,7 +18,8 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 
-from expanded_groups_data import GROUP_SEP, add_group_name
+from expanded_groups_data import (GROUP_SEP, LAST_ASSIGN_PATH, PENDING_MAX_AGE,
+                                  PENDING_TARGET_PATH, add_group_name)
 from expanded_groups_dbus import quiet_stderr
 
 
@@ -27,7 +31,9 @@ class AssignGroup(inkex.EffectExtension):
             inkex.errormsg("Select at least one object on the canvas first.")
             return
 
-        name = self.prompt_for_name()
+        name = self.pending_target()
+        if name is None:
+            name = self.prompt_for_name()
         if name is None:
             return  # cancelled
         if not name:
@@ -41,6 +47,22 @@ class AssignGroup(inkex.EffectExtension):
             if node.get('id') is None:
                 node.set('id', self.svg.get_unique_id('object'))
             add_group_name(node, name)
+
+        with open(LAST_ASSIGN_PATH, 'w') as f:
+            json.dump({'name': name, 'ids': [n.get('id') for n in selected]}, f)
+
+    def pending_target(self):
+        """Group name left by the browse panel's context menu, if fresh.
+        Consumed (deleted) either way so it can't apply twice."""
+        try:
+            with open(PENDING_TARGET_PATH) as f:
+                rec = json.load(f)
+            os.remove(PENDING_TARGET_PATH)
+        except (OSError, ValueError):
+            return None
+        if time.time() - rec.get('time', 0) > PENDING_MAX_AGE:
+            return None
+        return rec.get('name') or None
 
     def prompt_for_name(self):
         # Creating/showing the first GTK window in this process is what
