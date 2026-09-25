@@ -36,14 +36,26 @@ import time
 import warnings
 warnings.filterwarnings('ignore')  # before the gi import in expanded_groups_dbus
 
+os.environ.setdefault('NO_AT_BRIDGE', '1')  # see assign_group.py for why
+
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 
-from expanded_groups_data import GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_PATH, merge_names
+from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_PATH,
+                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, set_attribute_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.3.0"
+VERSION = "3.6.0"
+
+# Pause between consecutive live D-Bus select+set-attribute pairs when
+# looping over several objects (delete/remove/rename). Firing these back
+# to back with no gap was observed to occasionally race Inkscape's own
+# document model: the new attribute write for object N+1 would land as
+# stray text between elements instead of inside the right start tag,
+# corrupting the SVG once any later effect script re-serialized the
+# document. This is an empirical workaround, not a diagnosed root cause.
+LIVE_ACTION_PAUSE = 0.05
 
 # TreeStore columns: icon name, display text, kind ("group"/"object"), id
 # (group name for a group row, object id for an object row)
@@ -58,15 +70,25 @@ class ExpandedGroupsPanel:
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
         self.last_assign_mtime = self._assign_mtime()
+        self.last_focus_mtime = self._focus_mtime()
         with quiet_stderr():
             self.build_dialog()
 
     def build_dialog(self):
         win = Gtk.Window(title=f"Expanded Groups v{VERSION}")
         win.set_default_size(320, 460)
-        win.connect("destroy", Gtk.main_quit)
+        win.connect("destroy", self.on_destroy)
         win.connect("key-press-event", self.on_key_press)
         self.window = win
+
+        # Claims single-instance status for this launcher's "already open?"
+        # check. Written after the window exists so a focus request arriving
+        # right after this can find self.window ready.
+        try:
+            with open(PANEL_PID_PATH, 'w') as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         win.add(vbox)
@@ -128,6 +150,13 @@ class ExpandedGroupsPanel:
         win.show_all()
         GLib.timeout_add(500, self.poll_assign)
 
+    def on_destroy(self, *args):
+        try:
+            os.remove(PANEL_PID_PATH)
+        except OSError:
+            pass
+        Gtk.main_quit()
+
     def _icon_column(self, model_col):
         renderer = Gtk.CellRendererPixbuf()
         column = Gtk.TreeViewColumn("", renderer)
@@ -145,6 +174,13 @@ class ExpandedGroupsPanel:
     def _assign_mtime():
         try:
             return os.stat(LAST_ASSIGN_PATH).st_mtime_ns
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _focus_mtime():
+        try:
+            return os.stat(PANEL_FOCUS_REQUEST_PATH).st_mtime_ns
         except OSError:
             return 0
 
@@ -166,6 +202,15 @@ class ExpandedGroupsPanel:
                 pass
 
     def poll_assign(self):
+        # Also checked here (same 500ms tick) rather than a separate timer:
+        # the launcher touches PANEL_FOCUS_REQUEST_PATH instead of spawning
+        # a second panel when one is already open, and this is how that
+        # request reaches the existing window.
+        focus_mtime = self._focus_mtime()
+        if focus_mtime != self.last_focus_mtime:
+            self.last_focus_mtime = focus_mtime
+            self.window.present()
+
         # assign_group.py leaves a record of each run; fold it into this
         # panel's model (there's no way to query Inkscape for it).
         mtime = self._assign_mtime()
@@ -241,6 +286,33 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded)
         word = {'hidden': ('Hid', 'Showed'), 'locked': ('Locked', 'Unlocked')}[which][0 if turn_on else 1]
         self.show_status(f"{word} {len(ids)} object(s)")
+
+    def isolate_state(self, kind, item_id, which, this_value, other_value):
+        """Set 'this' item (a group's members, or a single object) to
+        this_value and every other known object to other_value, for
+        which='hidden' or 'locked'. Used by the "all but this" context
+        menu items."""
+        this_ids = set(self.by_name.get(item_id, []) if kind == "group" else [item_id])
+        other_ids = set(self.by_id.keys()) - this_ids
+        setter = set_hidden_live if which == 'hidden' else set_locked_live
+
+        if this_ids:
+            select_by_id_live(list(this_ids))
+            setter(this_value)
+            for i in this_ids:
+                self.state_of(i)[which] = this_value
+        if other_ids:
+            select_by_id_live(list(other_ids))
+            setter(other_value)
+            for i in other_ids:
+                self.state_of(i)[which] = other_value
+
+        expanded = self._expanded_groups()
+        self.refresh_tree()
+        self._restore_expanded(expanded)
+        verb = {'hidden': 'Hid', 'locked': 'Locked'}[which] if other_value else \
+               {'hidden': 'Showed', 'locked': 'Unlocked'}[which]
+        self.show_status(f"{verb} {len(other_ids)} object(s) other than “{item_id}”")
 
     def _expanded_groups(self):
         names = set()
@@ -347,11 +419,14 @@ class ExpandedGroupsPanel:
         # already dedupes per-object, so this is a safe, foreseeable
         # operation, not an error case.
 
-        for node_id in list(self.by_name.get(old_name, [])):
+        members = list(self.by_name.get(old_name, []))
+        for i, node_id in enumerate(members):
             new_names = merge_names(self.by_id[node_id], rename_from=old_name, rename_to=new_name)
             self.by_id[node_id] = new_names
             select_by_id_live([node_id])
             set_attribute_live(GROUP_ATTR, '|'.join(new_names))
+            if i < len(members) - 1:
+                time.sleep(LIVE_ACTION_PAUSE)
 
         self.rebuild_by_name()
         self.refresh_tree()
@@ -380,11 +455,14 @@ class ExpandedGroupsPanel:
             "The objects themselves aren't affected.",
         ):
             return
-        for node_id in list(self.by_name.get(name, [])):
+        members = list(self.by_name.get(name, []))
+        for i, node_id in enumerate(members):
             new_names = merge_names(self.by_id[node_id], remove=name)
             self.by_id[node_id] = new_names
             select_by_id_live([node_id])
             set_attribute_live(GROUP_ATTR, '|'.join(new_names))
+            if i < len(members) - 1:
+                time.sleep(LIVE_ACTION_PAUSE)
         self.rebuild_by_name()
         self.refresh_tree()
         self.show_status(f"Deleted “{name}”")
@@ -395,7 +473,9 @@ class ExpandedGroupsPanel:
         select_by_id_live([node_id])
         set_attribute_live(GROUP_ATTR, '|'.join(new_names))
         self.rebuild_by_name()
+        expanded = self._expanded_groups()
         self.refresh_tree()
+        self._restore_expanded(expanded)
         self.show_status(f"Removed {node_id} from “{group_name}”")
 
     # -- context menu / keyboard -------------------------------------------
@@ -430,6 +510,21 @@ class ExpandedGroupsPanel:
             rem_item = Gtk.MenuItem(label=f"Remove from “{group_name}”")
             rem_item.connect("activate", lambda w: self.remove_object_from_group(group_name, item_id))
             menu.append(rem_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        hide_others = Gtk.MenuItem(label="Hide all but this")
+        hide_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'hidden', False, True))
+        menu.append(hide_others)
+        show_others = Gtk.MenuItem(label="Show all but this")
+        show_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'hidden', True, False))
+        menu.append(show_others)
+        lock_others = Gtk.MenuItem(label="Lock all but this")
+        lock_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'locked', False, True))
+        menu.append(lock_others)
+        unlock_others = Gtk.MenuItem(label="Unlock all but this")
+        unlock_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'locked', True, False))
+        menu.append(unlock_others)
+
         menu.show_all()
         menu.popup_at_pointer(event)
 

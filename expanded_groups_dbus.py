@@ -28,6 +28,8 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')  # must precede the gi import below
 
+os.environ.setdefault('NO_AT_BRIDGE', '1')  # see assign_group.py for why
+
 import inkex
 import gi
 gi.require_version('Gtk', '3.0')

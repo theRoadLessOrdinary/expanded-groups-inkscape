@@ -127,3 +127,12 @@ LAST_ASSIGN_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_last_ass
 # seconds, so a run that never happened can't hijack a later menu use.
 PENDING_TARGET_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_pending_target.json')
 PENDING_MAX_AGE = 30
+
+# The browse panel writes its own PID here on startup and removes it on
+# exit, so the launcher can tell whether a panel window is already open
+# and, if so, ask that instance to raise itself instead of spawning a
+# second one. PANEL_FOCUS_REQUEST_PATH's mtime is the signal the running
+# panel polls for -- there's no D-Bus server in the panel process, so a
+# touched file is the simplest cross-process nudge available.
+PANEL_PID_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel.pid')
+PANEL_FOCUS_REQUEST_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel_focus_request')

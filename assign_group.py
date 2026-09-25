@@ -14,6 +14,15 @@ import time
 import warnings
 warnings.filterwarnings('ignore')  # before the gi import below
 
+# Must be set before GTK initializes -- otherwise GTK tries to register
+# with the accessibility (AT-SPI) bus, which the Flatpak sandbox blocks.
+# That registration is async and times out well after quiet_stderr()'s
+# redirect window has already closed, so its "dbind-WARNING: Couldn't
+# register with accessibility bus" lands on real stderr regardless,
+# tripping Inkscape's "script produced additional output" dialog even
+# though the script itself succeeded.
+os.environ.setdefault('NO_AT_BRIDGE', '1')
+
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk

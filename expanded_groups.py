@@ -16,10 +16,33 @@ import json
 import os
 import sys
 import tempfile
+import time
 
-from expanded_groups_data import scan_groups_by_id, scan_states
+from expanded_groups_data import (scan_groups_by_id, scan_states,
+                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH)
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
+
+
+def panel_already_running():
+    """True if a panel process is alive and holding PANEL_PID_PATH. A PID
+    file left behind by a crashed panel (no clean exit to remove it) reads
+    as not-running here, since kill(pid, 0) fails for a dead process."""
+    try:
+        with open(PANEL_PID_PATH) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def request_panel_focus():
+    with open(PANEL_FOCUS_REQUEST_PATH, 'w') as f:
+        f.write(str(time.time()))
 
 
 def spawn_detached(argv):
@@ -63,6 +86,10 @@ def spawn_detached(argv):
 class ExpandedGroupsLauncher(inkex.EffectExtension):
 
     def effect(self):
+        if panel_already_running():
+            request_panel_focus()
+            return
+
         by_name, by_id = scan_groups_by_id(self.svg)
 
         fd, snapshot_path = tempfile.mkstemp(prefix='expanded_groups_', suffix='.json')
