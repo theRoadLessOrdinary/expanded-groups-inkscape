@@ -7,7 +7,11 @@
 	<effect>
 		<object-type>all</object-type>
 		<effects-menu>
-			<submenu name="Expanded Groups"/>
+			<submenu name="Map's Edge Tools" translatable="no">
+				<submenu name="General" translatable="no">
+					<submenu name="Groups" translatable="no" />
+				</submenu>
+			</submenu>
 		</effects-menu>
 	</effect>
 
