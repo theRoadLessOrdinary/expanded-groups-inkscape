@@ -46,7 +46,7 @@ from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_P
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, set_attribute_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 
 # Pause between consecutive live D-Bus select+set-attribute pairs when
 # looping over several objects (delete/remove/rename). Firing these back
@@ -258,7 +258,7 @@ class ExpandedGroupsPanel:
 
     @staticmethod
     def _eye_icon(hidden):
-        return "object-hidden-symbolic" if hidden else "object-visible-symbolic"
+        return "view-conceal-symbolic" if hidden else "view-reveal-symbolic"
 
     @staticmethod
     def _lock_icon(locked):
