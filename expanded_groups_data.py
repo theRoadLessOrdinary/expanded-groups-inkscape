@@ -22,6 +22,8 @@ import tempfile
 GROUP_NS = 'http://theroadlessordinary.com/namespace'
 inkex.NSS['trlo'] = GROUP_NS
 GROUP_ATTR = inkex.addNS('group', 'trlo')
+# Set by the Stitch Order extension (stitch-order/); shown here as its own entry.
+ORDER_ATTR = inkex.addNS('stitch_order', 'trlo')
 
 # An object can belong to more than one group at once, so trlo:group holds a
 # "|"-separated list of names (not comma or space -- a group name like
@@ -100,11 +102,27 @@ def scan_groups_by_id(svg):
     return by_name, by_id
 
 
+def scan_stitch_order(svg):
+    """Ids of the objects numbered by the Stitch Order extension, in stitch
+    order (number, then document order), same rule as stitch_order.py."""
+    numbered = []
+    for i, node in enumerate(svg.iter()):
+        value = node.get(ORDER_ATTR) if isinstance(node.tag, str) else None
+        if value is None or not node.get('id'):
+            continue
+        try:
+            numbered.append((float(value), i, node.get('id')))
+        except ValueError:
+            pass
+    return [node_id for _, _, node_id in sorted(numbered)]
+
+
 def scan_states(svg):
-    """{id: {'hidden': bool, 'locked': bool}} for every trlo:group node.
-    Only the node's own display/lock state, not inherited from ancestors."""
+    """{id: {'hidden': bool, 'locked': bool}} for every trlo:group node and
+    every stitch-order node. Only the node's own display/lock state, not
+    inherited from ancestors."""
     states = {}
-    for node in svg.xpath('//*[@trlo:group]', namespaces=inkex.NSS):
+    for node in svg.xpath('//*[@trlo:group or @trlo:stitch_order]', namespaces=inkex.NSS):
         node_id = node.get('id')
         if not node_id:
             continue
@@ -134,5 +152,9 @@ PENDING_MAX_AGE = 30
 # second one. PANEL_FOCUS_REQUEST_PATH's mtime is the signal the running
 # panel polls for -- there's no D-Bus server in the panel process, so a
 # touched file is the simplest cross-process nudge available.
+# Written by stitch_order.py after each change to the stitch order; the panel
+# polls it the same way as LAST_ASSIGN_PATH.
+ORDER_RECORD_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_last.json')
+
 PANEL_PID_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel.pid')
 PANEL_FOCUS_REQUEST_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel_focus_request')

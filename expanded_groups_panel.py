@@ -24,7 +24,13 @@ Because of that, this window's list can drift out of sync with reality
 if something outside this tool changes the same objects' trlo:group
 attribute while it's open. There's no live "refresh from Inkscape"
 available (no D-Bus query mechanism for it) - closing and reopening the
-tool re-scans the document fresh. The toolbar's Assign
+tool re-scans the document fresh.
+
+The first row, Stitch Order, is not a named group: it lists the objects
+numbered by the Stitch Order extension (stitch-order/), in sewing order.
+It selects, hides and locks like a group. Adding to it and removing from it
+run the Stitch Order extension's own Add/Remove/Clear actions, which leave
+a record (ORDER_RECORD_PATH) this panel polls to update the row. The toolbar's Assign
 button runs the same Assign To Group extension as the menu item; that
 extension leaves a small record this panel polls to update its list.
 """
@@ -42,11 +48,11 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 
-from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_PATH,
+from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, set_attribute_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.6.1"
+VERSION = "3.7.1"
 
 # Pause between consecutive live D-Bus select+set-attribute pairs when
 # looping over several objects (delete/remove/rename). Firing these back
@@ -62,14 +68,24 @@ LIVE_ACTION_PAUSE = 0.05
 # plus the eye/lock icon names shown at the right of each row
 COL_ICON, COL_NAME, COL_KIND, COL_ID, COL_EYE, COL_LOCK = range(6)
 
+# The Stitch Order row: kind "order", its object rows kind "order-object".
+# Its id can't clash with a group name typed by the user.
+ORDER_ROW_ID = "\x00stitch-order"
+ORDER_ADD_ACTION = 'maps-edge.stitch-order-add.noprefs'
+ORDER_REMOVE_ACTION = 'maps-edge.stitch-order-remove.noprefs'
+ORDER_CLEAR_ACTION = 'maps-edge.stitch-order-clear.noprefs'
+
 
 class ExpandedGroupsPanel:
 
-    def __init__(self, by_name, by_id, states):
+    def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None):
+        self.inkscape_pid = inkscape_pid  # the window closes when this process ends
         self.by_name = by_name  # {group_name: [id, ...]}
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
+        self.stitch_order = list(stitch_order)  # [id, ...] in sewing order
         self.last_assign_mtime = self._assign_mtime()
+        self.last_order_mtime = self._mtime(ORDER_RECORD_PATH)
         self.last_focus_mtime = self._focus_mtime()
         with quiet_stderr():
             self.build_dialog()
@@ -178,6 +194,13 @@ class ExpandedGroupsPanel:
             return 0
 
     @staticmethod
+    def _mtime(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return 0
+
+    @staticmethod
     def _focus_mtime():
         try:
             return os.stat(PANEL_FOCUS_REQUEST_PATH).st_mtime_ns
@@ -201,7 +224,21 @@ class ExpandedGroupsPanel:
             except OSError:
                 pass
 
+    def inkscape_gone(self):
+        if self.inkscape_pid is None:
+            return False
+        try:
+            os.kill(self.inkscape_pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
     def poll_assign(self):
+        if self.inkscape_gone():
+            self.window.destroy()
+            return False
         # Also checked here (same 500ms tick) rather than a separate timer:
         # the launcher touches PANEL_FOCUS_REQUEST_PATH instead of spawning
         # a second panel when one is already open, and this is how that
@@ -210,6 +247,20 @@ class ExpandedGroupsPanel:
         if focus_mtime != self.last_focus_mtime:
             self.last_focus_mtime = focus_mtime
             self.window.present()
+
+        # stitch_order.py leaves the whole order after each change.
+        order_mtime = self._mtime(ORDER_RECORD_PATH)
+        if order_mtime != self.last_order_mtime:
+            self.last_order_mtime = order_mtime
+            try:
+                with open(ORDER_RECORD_PATH) as f:
+                    self.stitch_order = list(json.load(f)['ids'])
+                expanded = self._expanded_groups()
+                self.refresh_tree()
+                self._restore_expanded(expanded)
+                self.show_status(f"Stitch order: {len(self.stitch_order)} object(s)")
+            except (OSError, ValueError, KeyError):
+                pass
 
         # assign_group.py leaves a record of each run; fold it into this
         # panel's model (there's no way to query Inkscape for it).
@@ -235,6 +286,14 @@ class ExpandedGroupsPanel:
 
     def refresh_tree(self):
         self.store.clear()
+        order = self.stitch_order
+        oit = self.store.append(None, ["format-list-ordered", "Stitch Order", "order", ORDER_ROW_ID,
+                                       self._eye_icon(self.group_hidden(order)),
+                                       self._lock_icon(self.group_locked(order))])
+        for n, node_id in enumerate(order, start=1):
+            self.store.append(oit, ["text-x-generic", f"{n}. {node_id}", "order-object", node_id,
+                                    self._eye_icon(self.state_of(node_id)['hidden']),
+                                    self._lock_icon(self.state_of(node_id)['locked'])])
         for name in sorted(self.by_name.keys()):
             members = self.by_name[name]
             git = self.store.append(None, ["folder", name, "group", name,
@@ -246,6 +305,14 @@ class ExpandedGroupsPanel:
                                         self._lock_icon(self.state_of(node_id)['locked'])])
 
     # -- eye / lock state ---------------------------------------------------
+
+    def members(self, kind, item_id):
+        """The object ids a row stands for."""
+        if kind == "group":
+            return list(self.by_name.get(item_id, []))
+        if kind == "order":
+            return list(self.stitch_order)
+        return [item_id]
 
     def state_of(self, node_id):
         return self.states.setdefault(node_id, {'hidden': False, 'locked': False})
@@ -268,7 +335,7 @@ class ExpandedGroupsPanel:
         """which is 'hidden' or 'locked'. A group row sets every member to the
         opposite of the group's current combined state (all on -> all off,
         otherwise all on); an object row flips just that object."""
-        ids = self.by_name.get(item_id, []) if kind == "group" else [item_id]
+        ids = self.members(kind, item_id)
         if not ids:
             return
         turn_on = not all(self.state_of(i)[which] for i in ids)
@@ -292,8 +359,8 @@ class ExpandedGroupsPanel:
         this_value and every other known object to other_value, for
         which='hidden' or 'locked'. Used by the "all but this" context
         menu items."""
-        this_ids = set(self.by_name.get(item_id, []) if kind == "group" else [item_id])
-        other_ids = set(self.by_id.keys()) - this_ids
+        this_ids = set(self.members(kind, item_id))
+        other_ids = (set(self.by_id.keys()) | set(self.stitch_order)) - this_ids
         setter = set_hidden_live if which == 'hidden' else set_locked_live
 
         if this_ids:
@@ -312,7 +379,8 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded)
         verb = {'hidden': 'Hid', 'locked': 'Locked'}[which] if other_value else \
                {'hidden': 'Showed', 'locked': 'Unlocked'}[which]
-        self.show_status(f"{verb} {len(other_ids)} object(s) other than “{item_id}”")
+        name = "Stitch Order" if kind == "order" else item_id
+        self.show_status(f"{verb} {len(other_ids)} object(s) other than “{name}”")
 
     def _expanded_groups(self):
         names = set()
@@ -386,9 +454,11 @@ class ExpandedGroupsPanel:
             GLib.idle_add(self.start_rename, path)
             return False
 
-        if kind == "group":
-            select_by_id_live(self.by_name.get(item_id, []))
-            self.show_status(f"Selected {len(self.by_name.get(item_id, []))} object(s) in “{item_id}”")
+        if kind in ("group", "order"):
+            ids = self.members(kind, item_id)
+            select_by_id_live(ids)
+            name = "Stitch Order" if kind == "order" else item_id
+            self.show_status(f"Selected {len(ids)} object(s) in “{name}”")
         else:
             select_by_id_live([item_id])
             self.show_status(f"Selected {item_id}")
@@ -440,7 +510,11 @@ class ExpandedGroupsPanel:
             self.error("Select a group or object first.")
             return
         kind = self.store[it][COL_KIND]
-        if kind == "group":
+        if kind == "order":
+            self.clear_stitch_order()
+        elif kind == "order-object":
+            self.remove_from_stitch_order(self.store[it][COL_ID])
+        elif kind == "group":
             self.delete_group(self.store[it][COL_ID])
         else:
             parent_iter = self.store.iter_parent(it)
@@ -478,6 +552,28 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded)
         self.show_status(f"Removed {node_id} from “{group_name}”")
 
+    # -- stitch order (runs the Stitch Order extension) -------------------
+
+    def add_selection_to_stitch_order(self):
+        if run_extension_live(ORDER_ADD_ACTION):
+            self.show_status("Adding selection to Stitch Order...")
+
+    def remove_from_stitch_order(self, node_id):
+        select_by_id_live([node_id])
+        time.sleep(LIVE_ACTION_PAUSE)
+        if run_extension_live(ORDER_REMOVE_ACTION):
+            self.show_status(f"Removing {node_id} from Stitch Order...")
+
+    def clear_stitch_order(self):
+        if not self.stitch_order:
+            return
+        if not self.confirm("Clear the stitch order?",
+                            f"Takes the number off all {len(self.stitch_order)} object(s). "
+                            "The objects themselves aren't affected."):
+            return
+        if run_extension_live(ORDER_CLEAR_ACTION):
+            self.show_status("Clearing Stitch Order...")
+
     # -- context menu / keyboard -------------------------------------------
 
     def show_context_menu(self, event):
@@ -491,6 +587,24 @@ class ExpandedGroupsPanel:
         item_id = self.store[it][COL_ID]
 
         menu = Gtk.Menu()
+        if kind in ("order", "order-object"):
+            add_item = Gtk.MenuItem(label="Add Selection to Stitch Order")
+            add_item.connect("activate", lambda w: self.add_selection_to_stitch_order())
+            menu.append(add_item)
+            menu.append(Gtk.SeparatorMenuItem())
+            if kind == "order":
+                clear_item = Gtk.MenuItem(label="Clear Stitch Order")
+                clear_item.connect("activate", lambda w: self.clear_stitch_order())
+                menu.append(clear_item)
+            else:
+                rem_item = Gtk.MenuItem(label="Remove from Stitch Order")
+                rem_item.connect("activate", lambda w: self.remove_from_stitch_order(item_id))
+                menu.append(rem_item)
+            self._append_isolate_items(menu, kind, item_id)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return
+
         target = item_id if kind == "group" else self.store[self.store.iter_parent(it)][COL_ID]
         add_item = Gtk.MenuItem(label=f"Add Selection to “{target}”")
         add_item.connect("activate", lambda w: self.assign_selection_to(target))
@@ -511,6 +625,11 @@ class ExpandedGroupsPanel:
             rem_item.connect("activate", lambda w: self.remove_object_from_group(group_name, item_id))
             menu.append(rem_item)
 
+        self._append_isolate_items(menu, kind, item_id)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _append_isolate_items(self, menu, kind, item_id):
         menu.append(Gtk.SeparatorMenuItem())
         hide_others = Gtk.MenuItem(label="Hide all but this")
         hide_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'hidden', False, True))
@@ -525,9 +644,6 @@ class ExpandedGroupsPanel:
         unlock_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'locked', True, False))
         menu.append(unlock_others)
 
-        menu.show_all()
-        menu.popup_at_pointer(event)
-
     def on_key_press(self, widget, event):
         keyname = Gdk.keyval_name(event.keyval)
         if keyname in ("Delete", "BackSpace"):
@@ -538,14 +654,19 @@ class ExpandedGroupsPanel:
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: expanded_groups_panel.py <snapshot.json>", file=sys.stderr)
+        print("usage: expanded_groups_panel.py <snapshot.json> [inkscape pid]", file=sys.stderr)
         sys.exit(1)
 
     with open(sys.argv[1]) as f:
         snapshot = json.load(f)
 
+    try:
+        inkscape_pid = int(sys.argv[2])
+    except (IndexError, ValueError):
+        inkscape_pid = None
     ExpandedGroupsPanel(snapshot.get('by_name', {}), snapshot.get('by_id', {}),
-                        snapshot.get('states', {}))
+                        snapshot.get('states', {}), snapshot.get('stitch_order', []),
+                        inkscape_pid)
     Gtk.main()
 
 

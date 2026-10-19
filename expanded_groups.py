@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-from expanded_groups_data import (scan_groups_by_id, scan_states,
+from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH)
 
 VERSION = "2.4.0"
@@ -43,6 +43,38 @@ def panel_already_running():
 def request_panel_focus():
     with open(PANEL_FOCUS_REQUEST_PATH, 'w') as f:
         f.write(str(time.time()))
+
+
+def _proc_stat(pid):
+    """(name, parent pid) of a process, from /proc, or None."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            data = f.read()
+    except OSError:
+        return None
+    name = data[data.index('(') + 1:data.rindex(')')]
+    return name, int(data[data.rindex(')') + 2:].split()[1])
+
+
+def find_inkscape_pid():
+    """Inkscape's pid, so the panel can close when Inkscape does. Extensions
+    are not direct children of Inkscape, so walk up the ancestors, then fall
+    back to the lowest-numbered inkscape process (same as the Tool Panel)."""
+    pid = os.getppid()
+    while pid > 1:
+        stat = _proc_stat(pid)
+        if stat is None:
+            break
+        if stat[0].startswith('inkscape'):
+            return pid
+        pid = stat[1]
+    found = []
+    for entry in os.listdir('/proc'):
+        if entry.isdigit():
+            stat = _proc_stat(int(entry))
+            if stat and stat[0].startswith('inkscape'):
+                found.append(int(entry))
+    return min(found) if found else None
 
 
 def spawn_detached(argv):
@@ -95,12 +127,17 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
         fd, snapshot_path = tempfile.mkstemp(prefix='expanded_groups_', suffix='.json')
         with os.fdopen(fd, 'w') as f:
             json.dump({'by_name': by_name, 'by_id': by_id,
+                       'stitch_order': scan_stitch_order(self.svg),
                        'states': scan_states(self.svg)}, f)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         panel_script = os.path.join(script_dir, 'expanded_groups_panel.py')
 
-        spawn_detached([panel_script, snapshot_path])
+        argv = [panel_script, snapshot_path]
+        inkscape_pid = find_inkscape_pid()
+        if inkscape_pid is not None:
+            argv.append(str(inkscape_pid))
+        spawn_detached(argv)
 
         # No self.svg changes were made, so Inkscape has nothing to reload.
 
