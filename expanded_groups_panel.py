@@ -6,7 +6,9 @@ Inkscape window.
 
 Top-level rows are group names; expanding one reveals its member object
 ids as child rows. Clicking a group row selects every member live on
-canvas; clicking an object row selects just that one. Double-click (or
+canvas; clicking an object row selects just that one. Shift+click (or
+Ctrl+click) adds a row to the selection or takes it out, and the canvas
+selection becomes everything in all the selected rows. Double-click (or
 Rename, toolbar/context menu) renames a group inline. Delete removes a
 group's membership from all its objects, or - on an object row - just
 that one object's membership in its parent group. No drag-and-drop, no
@@ -52,7 +54,7 @@ from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_P
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, set_attribute_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.7.1"
+VERSION = "3.8.0"
 
 # Pause between consecutive live D-Bus select+set-attribute pairs when
 # looping over several objects (delete/remove/rename). Firing these back
@@ -151,7 +153,7 @@ class ExpandedGroupsPanel:
         self.eye_col = self._icon_column(COL_EYE)
         self.lock_col = self._icon_column(COL_LOCK)
 
-        self.tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.connect("button-press-event", self.on_button_press)
 
         scroll = Gtk.ScrolledWindow()
@@ -424,8 +426,22 @@ class ExpandedGroupsPanel:
         return response == Gtk.ResponseType.YES
 
     def _selected_iter(self):
-        model, it = self.tree.get_selection().get_selected()
-        return it
+        """The first selected row (rename and delete act on one row)."""
+        model, paths = self.tree.get_selection().get_selected_rows()
+        return model.get_iter(paths[0]) if paths else None
+
+    def select_rows_on_canvas(self):
+        """Select, on the canvas, everything in all the selected rows."""
+        model, paths = self.tree.get_selection().get_selected_rows()
+        ids, seen = [], set()
+        for path in paths:
+            row = model[path]
+            for node_id in self.members(row[COL_KIND], row[COL_ID]):
+                if node_id not in seen:
+                    seen.add(node_id)
+                    ids.append(node_id)
+        select_by_id_live(ids)
+        self.show_status(f"Selected {len(ids)} object(s) in {len(paths)} row(s)")
 
     # -- click to select / double-click to rename -------------------------
 
@@ -453,6 +469,22 @@ class ExpandedGroupsPanel:
         if event.type == Gdk.EventType._2BUTTON_PRESS and kind == "group":
             GLib.idle_add(self.start_rename, path)
             return False
+
+        # Shift+click (or Ctrl+click) adds the row to the selection, or takes
+        # it out again, like Shift+click on the canvas.
+        if event.state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK):
+            selection = self.tree.get_selection()
+            if selection.path_is_selected(path):
+                selection.unselect_path(path)
+            else:
+                selection.select_path(path)
+            self.select_rows_on_canvas()
+            return True
+
+        # A plain click makes this the only selected row.
+        selection = self.tree.get_selection()
+        selection.unselect_all()
+        selection.select_path(path)
 
         if kind in ("group", "order"):
             ids = self.members(kind, item_id)
@@ -581,7 +613,10 @@ class ExpandedGroupsPanel:
         if path_info is None:
             return
         path = path_info[0]
-        self.tree.get_selection().select_path(path)
+        selection = self.tree.get_selection()
+        if not selection.path_is_selected(path):
+            selection.unselect_all()
+            selection.select_path(path)
         it = self.store.get_iter(path)
         kind = self.store[it][COL_KIND]
         item_id = self.store[it][COL_ID]
