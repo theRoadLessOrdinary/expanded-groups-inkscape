@@ -6,9 +6,11 @@ Inkscape window.
 
 Top-level rows are group names; expanding one reveals its member object
 ids as child rows. Clicking a group row selects every member live on
-canvas; clicking an object row selects just that one. Shift+click (or
-Ctrl+click) adds a row to the selection or takes it out, and the canvas
-selection becomes everything in all the selected rows. Double-click (or
+canvas; clicking an object row selects just that one. Ctrl+click adds a
+row to the selection or takes it out, Shift+click selects every row from
+the last one clicked to this one, and the canvas selection becomes
+everything in all the selected rows. Right-click and Delete act on all
+the selected rows. Double-click (or
 Rename, toolbar/context menu) renames a group inline. Delete removes a
 group's membership from all its objects, or - on an object row - just
 that one object's membership in its parent group. No nested groups
@@ -66,7 +68,7 @@ from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_R
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.9.0"
+VERSION = "3.13.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -101,7 +103,9 @@ INTO = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
 
 class ExpandedGroupsPanel:
 
-    def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=()):
+    def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=(),
+                 labels=None):
+        self.labels = dict(labels or {})  # {id: Inkscape label}; rows show the label, else the id
         self.inkscape_pid = inkscape_pid  # the window closes when this process ends
         self.group_order = list(group_order)  # names in dragged order; others follow, sorted
         self.by_name = by_name  # {group_name: [id, ...]}
@@ -115,6 +119,7 @@ class ExpandedGroupsPanel:
         self.drag_y = None           # last drag height over the list, for scrolling
         self.hold_selection = False  # keep a multi-row selection while it may be dragged
         self.pending_click = None    # the click to finish on release if no drag starts
+        self.anchor_path = None      # where a Shift+click range starts
         with quiet_stderr():
             self.build_dialog()
 
@@ -292,7 +297,9 @@ class ExpandedGroupsPanel:
             self.last_order_mtime = order_mtime
             try:
                 with open(ORDER_RECORD_PATH) as f:
-                    self.stitch_order = list(json.load(f)['ids'])
+                    rec = json.load(f)
+                self.stitch_order = list(rec['ids'])
+                self.labels.update(rec.get('labels', {}))
                 expanded = self._expanded_groups()
                 self.refresh_tree()
                 self._restore_expanded(expanded)
@@ -309,6 +316,7 @@ class ExpandedGroupsPanel:
                 with open(LAST_ASSIGN_PATH) as f:
                     rec = json.load(f)
                 name = rec['name']
+                self.labels.update(rec.get('labels', {}))
                 for node_id in rec['ids']:
                     names = self.by_id.setdefault(node_id, [])
                     if name not in names:
@@ -322,14 +330,24 @@ class ExpandedGroupsPanel:
 
     # -- tree building ---------------------------------------------------
 
-    def refresh_tree(self):
+    def refresh_tree(self, renamed=None):
+        """Rebuild the list from the model, keeping which rows are selected
+        and expanded. renamed=(old, new) carries a renamed group's rows over."""
+        selected = self.selected_rows() if len(self.store) else []
+        expanded = self._expanded_groups()
+        if renamed:
+            old, new = renamed
+            selected = [(k, new if (k == "group" and i == old) else i, new if p == old else p)
+                        for k, i, p in selected]
+            expanded = {new if n == old else n for n in expanded}
+        self.anchor_path = None
         self.store.clear()
         order = self.stitch_order
         oit = self.store.append(None, ["format-list-ordered", "Stitch Order", "order", ORDER_ROW_ID,
                                        self._eye_icon(self.group_hidden(order)),
                                        self._lock_icon(self.group_locked(order))])
         for n, node_id in enumerate(order, start=1):
-            self.store.append(oit, ["text-x-generic", f"{n}. {node_id}", "order-object", node_id,
+            self.store.append(oit, ["text-x-generic", f"{n}. {self.name_of(node_id)}", "order-object", node_id,
                                     self._eye_icon(self.state_of(node_id)['hidden']),
                                     self._lock_icon(self.state_of(node_id)['locked'])])
         for name in self.ordered_group_names():
@@ -338,9 +356,15 @@ class ExpandedGroupsPanel:
                                            self._eye_icon(self.group_hidden(members)),
                                            self._lock_icon(self.group_locked(members))])
             for node_id in members:
-                self.store.append(git, ["text-x-generic", node_id, "object", node_id,
+                self.store.append(git, ["text-x-generic", self.name_of(node_id), "object", node_id,
                                         self._eye_icon(self.state_of(node_id)['hidden']),
                                         self._lock_icon(self.state_of(node_id)['locked'])])
+        self._restore_expanded(expanded)
+        self.reselect(selected)
+
+    def name_of(self, node_id):
+        """What a row shows for an object: its label, or its id if it has none."""
+        return self.labels.get(node_id) or node_id
 
     def ordered_group_names(self):
         """Groups in the order they were dragged into, then the rest sorted."""
@@ -374,14 +398,18 @@ class ExpandedGroupsPanel:
     def _lock_icon(locked):
         return "object-locked-symbolic" if locked else "object-unlocked-symbolic"
 
-    def toggle_state(self, kind, item_id, which):
-        """which is 'hidden' or 'locked'. A group row sets every member to the
-        opposite of the group's current combined state (all on -> all off,
-        otherwise all on); an object row flips just that object."""
-        ids = self.members(kind, item_id)
-        if not ids:
+    def toggle_state(self, kind, item_id, which, rows=None):
+        """which is 'hidden' or 'locked'. The clicked row decides: a group row
+        sets every member to the opposite of the group's current combined
+        state (all on -> all off, otherwise all on); an object row flips that
+        object. With rows (the selected rows, when the clicked one is among
+        them), every object in all of them gets that same new state."""
+        clicked = self.members(kind, item_id)
+        if not clicked:
             return
-        turn_on = not all(self.state_of(i)[which] for i in ids)
+        turn_on = not all(self.state_of(i)[which] for i in clicked)
+        ids = list(dict.fromkeys(i for k, r, _ in (rows or [(kind, item_id, None)])
+                                 for i in self.members(k, r)))
         select_by_id_live(ids)
         if which == 'hidden':
             ok = set_hidden_live(turn_on)
@@ -397,12 +425,13 @@ class ExpandedGroupsPanel:
         word = {'hidden': ('Hid', 'Showed'), 'locked': ('Locked', 'Unlocked')}[which][0 if turn_on else 1]
         self.show_status(f"{word} {len(ids)} object(s)")
 
-    def isolate_state(self, kind, item_id, which, this_value, other_value):
-        """Set 'this' item (a group's members, or a single object) to
-        this_value and every other known object to other_value, for
-        which='hidden' or 'locked'. Used by the "all but this" context
-        menu items."""
-        this_ids = set(self.members(kind, item_id))
+    def isolate_state(self, rows, which, this_value, other_value):
+        """Set the objects in these rows to this_value and every other known
+        object to other_value, for which='hidden' or 'locked'. Used by the
+        "all but this" context menu items."""
+        this_ids = set()
+        for kind, item_id, _ in rows:
+            this_ids.update(self.members(kind, item_id))
         other_ids = (set(self.by_id.keys()) | set(self.stitch_order)) - this_ids
         setter = set_hidden_live if which == 'hidden' else set_locked_live
 
@@ -422,8 +451,7 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded)
         verb = {'hidden': 'Hid', 'locked': 'Locked'}[which] if other_value else \
                {'hidden': 'Showed', 'locked': 'Unlocked'}[which]
-        name = "Stitch Order" if kind == "order" else item_id
-        self.show_status(f"{verb} {len(other_ids)} object(s) other than “{name}”")
+        self.show_status(f"{verb} {len(other_ids)} object(s) other than {self.rows_label(rows)}")
 
     def _expanded_groups(self):
         names = set()
@@ -466,6 +494,49 @@ class ExpandedGroupsPanel:
             dialog.destroy()
         return response == Gtk.ResponseType.YES
 
+    def selected_rows(self):
+        """(kind, id, parent group or None) for each selected row."""
+        model, paths = self.tree.get_selection().get_selected_rows()
+        rows = []
+        for path in paths:
+            it = model.get_iter(path)
+            parent = model.iter_parent(it)
+            rows.append((model[it][COL_KIND], model[it][COL_ID],
+                         model[parent][COL_ID] if parent is not None else None))
+        return rows
+
+    def reselect(self, rows):
+        """Select these (kind, id, parent) rows again after a refresh. An
+        object that moved to another group is selected where it is now."""
+        wanted = set(rows)
+        selection = self.tree.get_selection()
+        found, moved = set(), {}
+
+        def walk(it, parent):
+            while it is not None:
+                row = self.store[it]
+                key = (row[COL_KIND], row[COL_ID], parent)
+                if key in wanted:
+                    selection.select_iter(it)
+                    found.add(key)
+                else:
+                    moved.setdefault(key[:2], []).append(it)
+                walk(self.store.iter_children(it), row[COL_ID])
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first(), None)
+        for key in wanted - found:
+            for it in moved.get(key[:2], []):
+                selection.select_iter(it)
+
+    @staticmethod
+    def rows_label(rows):
+        if len(rows) == 1:
+            kind, item_id, _ = rows[0]
+            if kind == "order":
+                return "“Stitch Order”"
+            return f"“{item_id if kind == 'group' else self.name_of(item_id)}”"
+        return f"the {len(rows)} selected rows"
+
     def _selected_iter(self):
         """The first selected row (rename and delete act on one row)."""
         model, paths = self.tree.get_selection().get_selected_rows()
@@ -489,7 +560,7 @@ class ExpandedGroupsPanel:
     def on_button_press(self, widget, event):
         if event.button == 3:
             self.show_context_menu(event)
-            return False
+            return True  # otherwise the tree would select only this row
         if event.button != 1:
             return False
 
@@ -504,21 +575,36 @@ class ExpandedGroupsPanel:
         if path_info[1] in (self.eye_col, self.lock_col):
             which = 'hidden' if path_info[1] is self.eye_col else 'locked'
             if event.type == Gdk.EventType.BUTTON_PRESS:
-                self.toggle_state(kind, item_id, which)
+                # On one of several selected rows it acts on all of them.
+                selection = self.tree.get_selection()
+                rows = None
+                if selection.path_is_selected(path) and selection.count_selected_rows() > 1:
+                    rows = self.selected_rows()
+                self.toggle_state(kind, item_id, which, rows)
             return True
 
         if event.type == Gdk.EventType._2BUTTON_PRESS and kind == "group":
             GLib.idle_add(self.start_rename, path)
             return False
 
-        # Shift+click (or Ctrl+click) adds the row to the selection, or takes
-        # it out again, like Shift+click on the canvas.
-        if event.state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK):
-            selection = self.tree.get_selection()
+        # Shift+click selects every row from the last one clicked to this one
+        # (Ctrl+Shift adds them to the selection). Ctrl+click adds the row to
+        # the selection, or takes it out again.
+        shift = event.state & Gdk.ModifierType.SHIFT_MASK
+        ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
+        selection = self.tree.get_selection()
+        if shift and self.anchor_path is not None:
+            if not ctrl:
+                selection.unselect_all()
+            selection.select_range(self.anchor_path, path)
+            self.select_rows_on_canvas()
+            return True
+        if shift or ctrl:
             if selection.path_is_selected(path):
                 selection.unselect_path(path)
             else:
                 selection.select_path(path)
+            self.anchor_path = path.copy()
             self.select_rows_on_canvas()
             return True
 
@@ -549,6 +635,7 @@ class ExpandedGroupsPanel:
         selection = self.tree.get_selection()
         selection.unselect_all()
         selection.select_path(path)
+        self.anchor_path = path.copy()
 
         if kind in ("group", "order"):
             ids = self.members(kind, item_id)
@@ -557,7 +644,7 @@ class ExpandedGroupsPanel:
             self.show_status(f"Selected {len(ids)} object(s) in “{name}”")
         else:
             select_by_id_live([item_id])
-            self.show_status(f"Selected {item_id}")
+            self.show_status(f"Selected {self.name_of(item_id)}")
 
     def start_rename(self, path):
         self.text_renderer.set_property("editable", True)
@@ -591,50 +678,65 @@ class ExpandedGroupsPanel:
             self.group_order = [new_name if n == old_name else n for n in self.group_order]
         if not self.apply_groups(changes, with_order=True):
             return
-        self.refresh_tree()
+        self.refresh_tree(renamed=(old_name, new_name))
         self.show_status(f"Renamed “{old_name}” to “{new_name}”")
 
     # -- delete / remove ---------------------------------------------------
 
     def delete_selected(self):
-        it = self._selected_iter()
-        if it is None:
+        rows = self.selected_rows()
+        if not rows:
             self.error("Select a group or object first.")
             return
-        kind = self.store[it][COL_KIND]
-        if kind == "order":
+        kinds = {kind for kind, _, _ in rows}
+        if "order" in kinds:
             self.clear_stitch_order()
-        elif kind == "order-object":
-            self.remove_from_stitch_order(self.store[it][COL_ID])
-        elif kind == "group":
-            self.delete_group(self.store[it][COL_ID])
+        elif kinds == {"order-object"}:
+            self.remove_from_stitch_order([item_id for _, item_id, _ in rows])
+        elif kinds == {"group"}:
+            self.delete_groups([item_id for _, item_id, _ in rows])
+        elif kinds == {"object"}:
+            self.remove_objects([(item_id, parent) for _, item_id, parent in rows])
         else:
-            parent_iter = self.store.iter_parent(it)
-            group_name = self.store[parent_iter][COL_ID]
-            self.remove_object_from_group(group_name, self.store[it][COL_ID])
+            self.error("Select only groups, only objects in groups, or only objects in Stitch Order.")
 
-    def delete_group(self, name):
-        count = len(self.by_name.get(name, []))
+    def delete_groups(self, names):
+        ids = {i for name in names for i in self.by_name.get(name, [])}
+        title = f"Delete “{names[0]}”?" if len(names) == 1 else f"Delete {len(names)} groups?"
         if not self.confirm(
-            f"Delete “{name}”?",
-            f"Removes this group membership from all {count} object(s). "
+            title,
+            f"Removes {'this group' if len(names) == 1 else 'these groups'} from all {len(ids)} object(s). "
             "The objects themselves aren't affected.",
         ):
             return
-        changes = {node_id: merge_names(self.by_id[node_id], remove=name)
-                   for node_id in self.by_name.get(name, [])}
+        changes = {}
+        for node_id in ids:
+            remaining = self.by_id[node_id]
+            for name in names:
+                remaining = merge_names(remaining, remove=name)
+            changes[node_id] = remaining
         if not self.apply_groups(changes):
             return
         self.refresh_tree()
-        self.show_status(f"Deleted “{name}”")
+        if len(names) == 1:
+            self.show_status(f"Deleted “{names[0]}”")
+        else:
+            self.show_status(f"Deleted {len(names)} groups")
 
-    def remove_object_from_group(self, group_name, node_id):
-        if not self.apply_groups({node_id: merge_names(self.by_id[node_id], remove=group_name)}):
+    def remove_objects(self, pairs):
+        """Take each (object id, group name) membership away."""
+        changes = {}
+        for node_id, group_name in pairs:
+            changes[node_id] = merge_names(changes.get(node_id, self.by_id[node_id]), remove=group_name)
+        if not self.apply_groups(changes):
             return
         expanded = self._expanded_groups()
         self.refresh_tree()
         self._restore_expanded(expanded)
-        self.show_status(f"Removed {node_id} from “{group_name}”")
+        if len(pairs) == 1:
+            self.show_status(f"Removed {self.name_of(pairs[0][0])} from “{pairs[0][1]}”")
+        else:
+            self.show_status(f"Removed {len(pairs)} object(s) from their groups")
 
     # -- stitch order (runs the Stitch Order extension) -------------------
 
@@ -642,11 +744,12 @@ class ExpandedGroupsPanel:
         if run_extension_live(ORDER_ADD_ACTION):
             self.show_status("Adding selection to Stitch Order...")
 
-    def remove_from_stitch_order(self, node_id):
-        select_by_id_live([node_id])
+    def remove_from_stitch_order(self, ids):
+        select_by_id_live(ids)
         time.sleep(LIVE_ACTION_PAUSE)
         if run_extension_live(ORDER_REMOVE_ACTION):
-            self.show_status(f"Removing {node_id} from Stitch Order...")
+            what = self.name_of(ids[0]) if len(ids) == 1 else f"{len(ids)} objects"
+            self.show_status(f"Removing {what} from Stitch Order...")
 
     def clear_stitch_order(self):
         if not self.stitch_order:
@@ -662,14 +765,7 @@ class ExpandedGroupsPanel:
 
     def on_drag_begin(self, widget, context):
         self.pending_click = None
-        model, paths = self.tree.get_selection().get_selected_rows()
-        rows = []
-        for path in paths:
-            it = model.get_iter(path)
-            parent = model.iter_parent(it)
-            rows.append((model[it][COL_KIND], model[it][COL_ID],
-                         model[parent][COL_ID] if parent is not None else None))
-        self.drag_rows = rows
+        self.drag_rows = self.selected_rows()
         self.drag_y = None
         GLib.timeout_add(50, self.drag_scroll)
 
@@ -858,6 +954,8 @@ class ExpandedGroupsPanel:
     # -- context menu / keyboard -------------------------------------------
 
     def show_context_menu(self, event):
+        """The menu acts on every selected row. Right-clicking a row that
+        isn't selected selects just that row first."""
         path_info = self.tree.get_path_at_pos(int(event.x), int(event.y))
         if path_info is None:
             return
@@ -866,67 +964,60 @@ class ExpandedGroupsPanel:
         if not selection.path_is_selected(path):
             selection.unselect_all()
             selection.select_path(path)
-        it = self.store.get_iter(path)
-        kind = self.store[it][COL_KIND]
-        item_id = self.store[it][COL_ID]
-
+            self.anchor_path = path.copy()
+        rows = self.selected_rows()
+        kinds = {kind for kind, _, _ in rows}
+        single = len(rows) == 1
+        kind, item_id, parent = rows[0]
         menu = Gtk.Menu()
-        if kind in ("order", "order-object"):
-            add_item = Gtk.MenuItem(label="Add Selection to Stitch Order")
-            add_item.connect("activate", lambda w: self.add_selection_to_stitch_order())
-            menu.append(add_item)
+
+        def add(label, callback):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda w: callback())
+            menu.append(item)
+
+        if kinds <= {"order", "order-object"}:
+            add("Add Selection to Stitch Order", self.add_selection_to_stitch_order)
             menu.append(Gtk.SeparatorMenuItem())
-            if kind == "order":
-                clear_item = Gtk.MenuItem(label="Clear Stitch Order")
-                clear_item.connect("activate", lambda w: self.clear_stitch_order())
-                menu.append(clear_item)
+            if "order" in kinds:
+                add("Clear Stitch Order", self.clear_stitch_order)
             else:
-                rem_item = Gtk.MenuItem(label="Remove from Stitch Order")
-                rem_item.connect("activate", lambda w: self.remove_from_stitch_order(item_id))
-                menu.append(rem_item)
-            self._append_isolate_items(menu, kind, item_id)
-            menu.show_all()
-            menu.popup_at_pointer(event)
-            return
+                ids = [i for _, i, _ in rows]
+                add("Remove from Stitch Order" if single else f"Remove {len(ids)} from Stitch Order",
+                    lambda: self.remove_from_stitch_order(ids))
+        elif kinds == {"group"}:
+            if single:
+                add(f"Add Selection to “{item_id}”", lambda: self.assign_selection_to(item_id))
+                menu.append(Gtk.SeparatorMenuItem())
+                add("Rename", lambda: self.start_rename(path))
+                menu.append(Gtk.SeparatorMenuItem())
+                add("Delete Group", lambda: self.delete_groups([item_id]))
+            else:
+                names = [i for _, i, _ in rows]
+                add(f"Delete {len(names)} Groups", lambda: self.delete_groups(names))
+        elif kinds == {"object"}:
+            if single:
+                add(f"Add Selection to “{parent}”", lambda: self.assign_selection_to(parent))
+                menu.append(Gtk.SeparatorMenuItem())
+                add(f"Remove from “{parent}”", lambda: self.remove_objects([(item_id, parent)]))
+            else:
+                pairs = [(i, g) for _, i, g in rows]
+                add(f"Remove {len(pairs)} from Their Groups", lambda: self.remove_objects(pairs))
 
-        target = item_id if kind == "group" else self.store[self.store.iter_parent(it)][COL_ID]
-        add_item = Gtk.MenuItem(label=f"Add Selection to “{target}”")
-        add_item.connect("activate", lambda w: self.assign_selection_to(target))
-        menu.append(add_item)
-        menu.append(Gtk.SeparatorMenuItem())
-        if kind == "group":
-            rename_item = Gtk.MenuItem(label="Rename")
-            rename_item.connect("activate", lambda w: self.start_rename(path))
-            menu.append(rename_item)
-            menu.append(Gtk.SeparatorMenuItem())
-            del_item = Gtk.MenuItem(label="Delete Group")
-            del_item.connect("activate", lambda w: self.delete_group(item_id))
-            menu.append(del_item)
-        else:
-            parent_iter = self.store.iter_parent(it)
-            group_name = self.store[parent_iter][COL_ID]
-            rem_item = Gtk.MenuItem(label=f"Remove from “{group_name}”")
-            rem_item.connect("activate", lambda w: self.remove_object_from_group(group_name, item_id))
-            menu.append(rem_item)
-
-        self._append_isolate_items(menu, kind, item_id)
+        self._append_isolate_items(menu, rows)
         menu.show_all()
         menu.popup_at_pointer(event)
 
-    def _append_isolate_items(self, menu, kind, item_id):
+    def _append_isolate_items(self, menu, rows):
         menu.append(Gtk.SeparatorMenuItem())
-        hide_others = Gtk.MenuItem(label="Hide all but this")
-        hide_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'hidden', False, True))
-        menu.append(hide_others)
-        show_others = Gtk.MenuItem(label="Show all but this")
-        show_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'hidden', True, False))
-        menu.append(show_others)
-        lock_others = Gtk.MenuItem(label="Lock all but this")
-        lock_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'locked', False, True))
-        menu.append(lock_others)
-        unlock_others = Gtk.MenuItem(label="Unlock all but this")
-        unlock_others.connect("activate", lambda w: self.isolate_state(kind, item_id, 'locked', True, False))
-        menu.append(unlock_others)
+        word = "this" if len(rows) == 1 else "these"
+        for label, which, this_value, other_value in (
+                ("Hide", 'hidden', False, True), ("Show", 'hidden', True, False),
+                ("Lock", 'locked', False, True), ("Unlock", 'locked', True, False)):
+            item = Gtk.MenuItem(label=f"{label} all but {word}")
+            item.connect("activate", lambda w, a=which, b=this_value, c=other_value:
+                         self.isolate_state(rows, a, b, c))
+            menu.append(item)
 
     def on_key_press(self, widget, event):
         keyname = Gdk.keyval_name(event.keyval)
@@ -950,7 +1041,7 @@ def main():
         inkscape_pid = None
     ExpandedGroupsPanel(snapshot.get('by_name', {}), snapshot.get('by_id', {}),
                         snapshot.get('states', {}), snapshot.get('stitch_order', []),
-                        inkscape_pid, snapshot.get('group_order', []))
+                        inkscape_pid, snapshot.get('group_order', []), snapshot.get('labels', {}))
     Gtk.main()
 
 

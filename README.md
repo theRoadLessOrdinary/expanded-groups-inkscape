@@ -58,7 +58,9 @@ see its member objects as child rows.
 | Change the order groups are listed in | Drag a group row up or down |
 | Move an object to another group | Drag its row onto the other group, or onto one of that group's objects |
 | Add an object to another group and keep it in its own | Hold Ctrl while you drop it |
-| Drag several rows at once | Shift+click or Ctrl+click rows of the same kind, then drag one of them |
+| Select several rows | Ctrl+click adds or removes one row; Shift+click selects every row from the last one clicked |
+| Act on several rows | Right-click or press Delete with them selected; the menu and Delete apply to all of them |
+| Drag several rows at once | Select rows of the same kind, then drag one of them |
 
 The eye and lock icons also appear on each object row. Deleting a group or
 removing an object only removes the tag; it never deletes the object.

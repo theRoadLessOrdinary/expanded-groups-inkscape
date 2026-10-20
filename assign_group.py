@@ -58,7 +58,8 @@ class AssignGroup(inkex.EffectExtension):
             add_group_name(node, name)
 
         with open(LAST_ASSIGN_PATH, 'w') as f:
-            json.dump({'name': name, 'ids': [n.get('id') for n in selected]}, f)
+            json.dump({'name': name, 'ids': [n.get('id') for n in selected],
+                       'labels': {n.get('id'): n.label for n in selected if n.label}}, f)
 
     def pending_target(self):
         """Group name left by the browse panel's context menu, if fresh.

@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 
-from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order, scan_group_order,
+from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order, scan_group_order, scan_labels,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH)
 
 VERSION = "2.4.0"
@@ -133,6 +133,7 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
             json.dump({'by_name': by_name, 'by_id': by_id,
                        'stitch_order': scan_stitch_order(self.svg),
                        'group_order': scan_group_order(self.svg),
+                       'labels': scan_labels(self.svg),
                        'states': scan_states(self.svg)}, f)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))

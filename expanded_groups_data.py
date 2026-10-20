@@ -120,6 +120,17 @@ def scan_stitch_order(svg):
     return [node_id for _, _, node_id in sorted(numbered)]
 
 
+def scan_labels(svg):
+    """{id: label} for every trlo:group or stitch-order node that has an
+    Inkscape label, so the panel can show labels instead of ids."""
+    labels = {}
+    for node in svg.xpath('//*[@trlo:group or @trlo:stitch_order]', namespaces=inkex.NSS):
+        label = node.get(inkex.addNS('label', 'inkscape'))
+        if label and node.get('id'):
+            labels[node.get('id')] = label
+    return labels
+
+
 def scan_group_order(svg):
     """The group names in the order the user dragged them into."""
     value = svg.get(GROUP_ORDER_ATTR) or ''
