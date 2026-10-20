@@ -11,13 +11,24 @@ Ctrl+click) adds a row to the selection or takes it out, and the canvas
 selection becomes everything in all the selected rows. Double-click (or
 Rename, toolbar/context menu) renames a group inline. Delete removes a
 group's membership from all its objects, or - on an object row - just
-that one object's membership in its parent group. No drag-and-drop, no
-nested groups (groups are flat; only the object rows nest, for display).
+that one object's membership in its parent group. No nested groups
+(groups are flat; only the object rows nest, for display).
+
+Drag and drop: drag rows inside Stitch Order to change the sewing order;
+drag a group up or down to change the order groups are listed in; drag an
+object onto another group (or onto one of its objects) to move it there,
+or hold Ctrl while dropping to add it to that group and keep it in its
+own. Shift/Ctrl+click several rows of the same kind to drag them together.
+The new stitch order goes through Stitch Order's hidden Reorder action and
+group changes through this extension's hidden group_apply.py, both told
+what to do through a small file (ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH).
+The group order is saved on the root <svg> as trlo:group_order.
 
 This never touches the SVG file. It loads its starting model from the
 JSON snapshot expanded_groups.py wrote, and every mutation goes out live
-through Inkscape's D-Bus Actions interface (select-by-id +
-object-set-attribute) so edits land in Inkscape's own in-memory document
+through Inkscape's D-Bus Actions interface, which runs group_apply.py on
+the open document (rename, delete, remove, move and the group order), so
+edits land in Inkscape's own in-memory document
 and stay correctly tracked by undo/unsaved-changes - this script never
 writes to disk itself. Its own model is then updated optimistically to
 match, since there's no D-Bus query to read live attribute values back.
@@ -50,19 +61,14 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 
-from expanded_groups_data import (GROUP_ATTR, LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
+from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
+                                   ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
-from expanded_groups_dbus import select_by_id_live, set_attribute_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
+from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.8.0"
+VERSION = "3.9.0"
 
-# Pause between consecutive live D-Bus select+set-attribute pairs when
-# looping over several objects (delete/remove/rename). Firing these back
-# to back with no gap was observed to occasionally race Inkscape's own
-# document model: the new attribute write for object N+1 would land as
-# stray text between elements instead of inside the right start tag,
-# corrupting the SVG once any later effect script re-serialized the
-# document. This is an empirical workaround, not a diagnosed root cause.
+# Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
 
 # TreeStore columns: icon name, display text, kind ("group"/"object"), id
@@ -76,12 +82,28 @@ ORDER_ROW_ID = "\x00stitch-order"
 ORDER_ADD_ACTION = 'maps-edge.stitch-order-add.noprefs'
 ORDER_REMOVE_ACTION = 'maps-edge.stitch-order-remove.noprefs'
 ORDER_CLEAR_ACTION = 'maps-edge.stitch-order-clear.noprefs'
+ORDER_REORDER_ACTION = 'maps-edge.stitch-order-reorder.noprefs'
+# Group membership is written by an extension, not object-set-attribute:
+# that action takes the attribute name literally, so "{namespace}group"
+# was saved as a broken attribute, and a prefix like "trlo:group" only
+# works when Inkscape knows that prefix for this document.
+GROUP_APPLY_ACTION = 'trlo.group-apply.noprefs'
+
+# Rows are only dragged inside this window.
+DRAG_TARGETS = [Gtk.TargetEntry.new('expanded-groups-row', Gtk.TargetFlags.SAME_WIDGET, 0)]
+# Scroll the list while a drag is this close to its top or bottom edge (px).
+DRAG_SCROLL_EDGE = 24
+DRAG_SCROLL_STEP = 12
+BEFORE = Gtk.TreeViewDropPosition.BEFORE
+AFTER = Gtk.TreeViewDropPosition.AFTER
+INTO = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
 
 
 class ExpandedGroupsPanel:
 
-    def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None):
+    def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=()):
         self.inkscape_pid = inkscape_pid  # the window closes when this process ends
+        self.group_order = list(group_order)  # names in dragged order; others follow, sorted
         self.by_name = by_name  # {group_name: [id, ...]}
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
@@ -89,6 +111,10 @@ class ExpandedGroupsPanel:
         self.last_assign_mtime = self._assign_mtime()
         self.last_order_mtime = self._mtime(ORDER_RECORD_PATH)
         self.last_focus_mtime = self._focus_mtime()
+        self.drag_rows = []          # (kind, id, parent group) of the rows being dragged
+        self.drag_y = None           # last drag height over the list, for scrolling
+        self.hold_selection = False  # keep a multi-row selection while it may be dragged
+        self.pending_click = None    # the click to finish on release if no drag starts
         with quiet_stderr():
             self.build_dialog()
 
@@ -154,7 +180,17 @@ class ExpandedGroupsPanel:
         self.lock_col = self._icon_column(COL_LOCK)
 
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.tree.get_selection().set_select_function(lambda *args: not self.hold_selection)
         self.tree.connect("button-press-event", self.on_button_press)
+        self.tree.connect("button-release-event", self.on_button_release)
+
+        actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
+        self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, DRAG_TARGETS, actions)
+        self.tree.enable_model_drag_dest(DRAG_TARGETS, actions)
+        self.tree.connect("drag-begin", self.on_drag_begin)
+        self.tree.connect("drag-end", self.on_drag_end)
+        self.tree.connect("drag-motion", self.on_drag_motion)
+        self.tree.connect("drag-drop", self.on_drag_drop)
 
         scroll = Gtk.ScrolledWindow()
         scroll.add(self.tree)
@@ -296,7 +332,7 @@ class ExpandedGroupsPanel:
             self.store.append(oit, ["text-x-generic", f"{n}. {node_id}", "order-object", node_id,
                                     self._eye_icon(self.state_of(node_id)['hidden']),
                                     self._lock_icon(self.state_of(node_id)['locked'])])
-        for name in sorted(self.by_name.keys()):
+        for name in self.ordered_group_names():
             members = self.by_name[name]
             git = self.store.append(None, ["folder", name, "group", name,
                                            self._eye_icon(self.group_hidden(members)),
@@ -305,6 +341,11 @@ class ExpandedGroupsPanel:
                 self.store.append(git, ["text-x-generic", node_id, "object", node_id,
                                         self._eye_icon(self.state_of(node_id)['hidden']),
                                         self._lock_icon(self.state_of(node_id)['locked'])])
+
+    def ordered_group_names(self):
+        """Groups in the order they were dragged into, then the rest sorted."""
+        names = [n for n in dict.fromkeys(self.group_order) if n in self.by_name]
+        return names + sorted(n for n in self.by_name if n not in names)
 
     # -- eye / lock state ---------------------------------------------------
 
@@ -481,7 +522,30 @@ class ExpandedGroupsPanel:
             self.select_rows_on_canvas()
             return True
 
-        # A plain click makes this the only selected row.
+        # A plain press on one of several selected rows may start dragging
+        # them all, so the selection waits until the button comes up.
+        selection = self.tree.get_selection()
+        if selection.path_is_selected(path) and selection.count_selected_rows() > 1:
+            self.hold_selection = True
+            self.pending_click = path
+            return False
+        self.click_row(path)
+        return False
+
+    def on_button_release(self, widget, event):
+        if event.button == 1 and self.pending_click is not None:
+            path = self.pending_click
+            self.pending_click = None
+            self.hold_selection = False
+            self.click_row(path)
+        return False
+
+    def click_row(self, path):
+        """A plain click: this becomes the only selected row, and its
+        objects the canvas selection."""
+        it = self.store.get_iter(path)
+        kind = self.store[it][COL_KIND]
+        item_id = self.store[it][COL_ID]
         selection = self.tree.get_selection()
         selection.unselect_all()
         selection.select_path(path)
@@ -494,7 +558,6 @@ class ExpandedGroupsPanel:
         else:
             select_by_id_live([item_id])
             self.show_status(f"Selected {item_id}")
-        return False
 
     def start_rename(self, path):
         self.text_renderer.set_property("editable", True)
@@ -521,16 +584,13 @@ class ExpandedGroupsPanel:
         # already dedupes per-object, so this is a safe, foreseeable
         # operation, not an error case.
 
-        members = list(self.by_name.get(old_name, []))
-        for i, node_id in enumerate(members):
-            new_names = merge_names(self.by_id[node_id], rename_from=old_name, rename_to=new_name)
-            self.by_id[node_id] = new_names
-            select_by_id_live([node_id])
-            set_attribute_live(GROUP_ATTR, '|'.join(new_names))
-            if i < len(members) - 1:
-                time.sleep(LIVE_ACTION_PAUSE)
-
-        self.rebuild_by_name()
+        changes = {}
+        for node_id in self.by_name.get(old_name, []):
+            changes[node_id] = merge_names(self.by_id[node_id], rename_from=old_name, rename_to=new_name)
+        if old_name in self.group_order:
+            self.group_order = [new_name if n == old_name else n for n in self.group_order]
+        if not self.apply_groups(changes, with_order=True):
+            return
         self.refresh_tree()
         self.show_status(f"Renamed “{old_name}” to “{new_name}”")
 
@@ -561,24 +621,16 @@ class ExpandedGroupsPanel:
             "The objects themselves aren't affected.",
         ):
             return
-        members = list(self.by_name.get(name, []))
-        for i, node_id in enumerate(members):
-            new_names = merge_names(self.by_id[node_id], remove=name)
-            self.by_id[node_id] = new_names
-            select_by_id_live([node_id])
-            set_attribute_live(GROUP_ATTR, '|'.join(new_names))
-            if i < len(members) - 1:
-                time.sleep(LIVE_ACTION_PAUSE)
-        self.rebuild_by_name()
+        changes = {node_id: merge_names(self.by_id[node_id], remove=name)
+                   for node_id in self.by_name.get(name, [])}
+        if not self.apply_groups(changes):
+            return
         self.refresh_tree()
         self.show_status(f"Deleted “{name}”")
 
     def remove_object_from_group(self, group_name, node_id):
-        new_names = merge_names(self.by_id[node_id], remove=group_name)
-        self.by_id[node_id] = new_names
-        select_by_id_live([node_id])
-        set_attribute_live(GROUP_ATTR, '|'.join(new_names))
-        self.rebuild_by_name()
+        if not self.apply_groups({node_id: merge_names(self.by_id[node_id], remove=group_name)}):
+            return
         expanded = self._expanded_groups()
         self.refresh_tree()
         self._restore_expanded(expanded)
@@ -605,6 +657,203 @@ class ExpandedGroupsPanel:
             return
         if run_extension_live(ORDER_CLEAR_ACTION):
             self.show_status("Clearing Stitch Order...")
+
+    # -- drag and drop -------------------------------------------------------
+
+    def on_drag_begin(self, widget, context):
+        self.pending_click = None
+        model, paths = self.tree.get_selection().get_selected_rows()
+        rows = []
+        for path in paths:
+            it = model.get_iter(path)
+            parent = model.iter_parent(it)
+            rows.append((model[it][COL_KIND], model[it][COL_ID],
+                         model[parent][COL_ID] if parent is not None else None))
+        self.drag_rows = rows
+        self.drag_y = None
+        GLib.timeout_add(50, self.drag_scroll)
+
+    def on_drag_end(self, widget, context):
+        self.drag_rows = []
+        self.drag_y = None
+        self.hold_selection = False
+
+    def drag_scroll(self):
+        """Scroll the list while a drag waits near its top or bottom."""
+        if not self.drag_rows:
+            return False
+        if self.drag_y is not None:
+            adj = self.tree.get_vadjustment()
+            height = self.tree.get_allocated_height()
+            if self.drag_y < DRAG_SCROLL_EDGE:
+                adj.set_value(max(adj.get_lower(), adj.get_value() - DRAG_SCROLL_STEP))
+            elif self.drag_y > height - DRAG_SCROLL_EDGE:
+                adj.set_value(min(adj.get_upper() - adj.get_page_size(),
+                                  adj.get_value() + DRAG_SCROLL_STEP))
+        return True
+
+    @staticmethod
+    def copy_wanted():
+        """Ctrl held: add an object to the group it is dropped on and keep it
+        in its own group too."""
+        display = Gdk.Display.get_default()
+        pointer = display.get_default_seat().get_pointer()
+        _, _, _, mask = display.get_default_screen().get_root_window().get_device_position(pointer)
+        return bool(mask & Gdk.ModifierType.CONTROL_MASK)
+
+    def drop_plan(self, x, y):
+        """What dropping the dragged rows here would do, as (what, value,
+        highlight path, highlight position), or None where they can't go."""
+        rows = self.drag_rows
+        kinds = {kind for kind, _, _ in rows}
+        if len(kinds) != 1:
+            return None
+        kind = kinds.pop()
+        dest = self.tree.get_dest_row_at_pos(x, y)
+        before = dest is not None and dest[1] in (BEFORE, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+        dest_kind = self.store[dest[0]][COL_KIND] if dest else None
+
+        if kind == "order-object":
+            if dest is None or dest_kind not in ("order", "order-object"):
+                return None
+            path = dest[0]
+            if dest_kind == "order":
+                at = 0 if before or self.tree.row_expanded(path) else len(self.stitch_order)
+            else:
+                at = path[1] if before else path[1] + 1
+            moving = [i for i in self.stitch_order if i in {r[1] for r in rows}]
+            rest = [i for i in self.stitch_order if i not in moving]
+            at -= sum(1 for i in self.stitch_order[:at] if i in moving)
+            return ("order", rest[:at] + moving + rest[at:], path, BEFORE if before else AFTER)
+
+        if kind == "group":
+            names = self.ordered_group_names()
+            if dest is None:
+                at, path, pos = len(names), Gtk.TreePath(len(names)), AFTER
+            elif dest_kind in ("order", "order-object"):
+                at, path, pos = 0, Gtk.TreePath(1), BEFORE
+            else:
+                top = Gtk.TreePath(dest[0][0])
+                index = top[0] - 1  # row 0 is Stitch Order
+                if dest_kind == "group" and before:
+                    at, path, pos = index, top, BEFORE
+                else:
+                    at, path, pos = index + 1, top, AFTER
+            if path[0] > len(names):
+                path = Gtk.TreePath(len(names))
+            moving = [n for n in names if n in {r[1] for r in rows}]
+            rest = [n for n in names if n not in moving]
+            at -= sum(1 for n in names[:at] if n in moving)
+            return ("groups", rest[:at] + moving + rest[at:], path, pos)
+
+        if kind == "object":
+            if dest is None or dest_kind not in ("group", "object"):
+                return None
+            top = Gtk.TreePath(dest[0][0])
+            target = self.store[top][COL_ID]
+            if all(parent == target for _, _, parent in rows):
+                return None
+            return ("move", target, top, INTO)
+        return None
+
+    def on_drag_motion(self, widget, context, x, y, time_):
+        self.drag_y = y
+        plan = self.drop_plan(x, y)
+        if plan is None:
+            self.tree.set_drag_dest_row(None, BEFORE)
+            Gdk.drag_status(context, 0, time_)
+            return True
+        self.tree.set_drag_dest_row(plan[2], plan[3])
+        copy = plan[0] == "move" and self.copy_wanted()
+        Gdk.drag_status(context, Gdk.DragAction.COPY if copy else Gdk.DragAction.MOVE, time_)
+        return True
+
+    def on_drag_drop(self, widget, context, x, y, time_):
+        plan = self.drop_plan(x, y)
+        copy = plan is not None and plan[0] == "move" and self.copy_wanted()
+        rows = list(self.drag_rows)
+        Gtk.drag_finish(context, plan is not None, False, time_)
+        if plan is not None:
+            # After the drag has let go of the pointer.
+            GLib.idle_add(self.apply_drop, plan, rows, copy)
+        return True
+
+    def apply_drop(self, plan, rows, copy):
+        what, value = plan[0], plan[1]
+        expanded = self._expanded_groups()
+        if what == "order":
+            if value != self.stitch_order:
+                self.set_stitch_order(value)
+        elif what == "groups":
+            if value != self.ordered_group_names():
+                self.group_order = value
+                if not self.apply_groups({}, with_order=True):
+                    return False
+                self.refresh_tree()
+                self._restore_expanded(expanded)
+                self.show_status("Group order changed")
+        elif what == "move":
+            self.move_objects(rows, value, copy, expanded)
+        return False
+
+    def set_stitch_order(self, ids):
+        with open(ORDER_PENDING_PATH, 'w') as f:
+            json.dump({'ids': ids, 'time': time.time()}, f)
+        if not run_extension_live(ORDER_REORDER_ACTION):
+            try:
+                os.remove(ORDER_PENDING_PATH)
+            except OSError:
+                pass
+            return
+        # The record Stitch Order leaves will confirm this; show it now.
+        expanded = self._expanded_groups()
+        self.stitch_order = list(ids)
+        self.refresh_tree()
+        self._restore_expanded(expanded)
+        self.show_status("Stitch order changed")
+
+    def apply_groups(self, changes, with_order=False):
+        """Write new group lists ({id: [name, ...]}) and, if asked, the
+        group order into the open document in one step (one undo), then
+        update this window's model to match."""
+        changes = {i: names for i, names in changes.items() if names != self.by_id.get(i, [])}
+        if not changes and not with_order:
+            return True
+        updated = dict(self.by_id)
+        updated.update(changes)
+        self.by_id = updated
+        self.rebuild_by_name()
+        rec = {'members': changes, 'time': time.time()}
+        if with_order:
+            rec['order'] = self.ordered_group_names()
+        with open(GROUP_APPLY_PENDING_PATH, 'w') as f:
+            json.dump(rec, f)
+        if run_extension_live(GROUP_APPLY_ACTION):
+            return True
+        try:
+            os.remove(GROUP_APPLY_PENDING_PATH)
+        except OSError:
+            pass
+        return False
+
+    def move_objects(self, rows, target, copy, expanded):
+        changes = {}
+        for _, node_id, source in rows:
+            if source == target and not copy:
+                continue
+            old = self.by_id.get(node_id, [])
+            if copy or source is None:
+                new = merge_names(old + [target])
+            else:
+                new = merge_names(old, rename_from=source, rename_to=target)
+            if new != old:
+                changes[node_id] = new
+        if not self.apply_groups(changes):
+            return
+        self.refresh_tree()
+        self._restore_expanded(expanded | {target})
+        verb = "Added" if copy else "Moved"
+        self.show_status(f"{verb} {len(changes)} object(s) to “{target}”")
 
     # -- context menu / keyboard -------------------------------------------
 
@@ -701,7 +950,7 @@ def main():
         inkscape_pid = None
     ExpandedGroupsPanel(snapshot.get('by_name', {}), snapshot.get('by_id', {}),
                         snapshot.get('states', {}), snapshot.get('stitch_order', []),
-                        inkscape_pid)
+                        inkscape_pid, snapshot.get('group_order', []))
     Gtk.main()
 
 

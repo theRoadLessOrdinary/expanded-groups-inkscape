@@ -14,11 +14,12 @@ stderr silent.
 import inkex
 import json
 import os
+import warnings
 import sys
 import tempfile
 import time
 
-from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order,
+from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order, scan_group_order,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH)
 
 VERSION = "2.4.0"
@@ -96,6 +97,9 @@ def spawn_detached(argv):
     subreaper, so nothing here or in Inkscape ever waits on it or holds a
     handle to it.
     """
+    # Python warns about fork() in a multi-threaded process; Inkscape would
+    # show that warning in a dialog that has to be dismissed.
+    warnings.simplefilter('ignore')
     pid = os.fork()
     if pid == 0:
         # First child.
@@ -128,6 +132,7 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
         with os.fdopen(fd, 'w') as f:
             json.dump({'by_name': by_name, 'by_id': by_id,
                        'stitch_order': scan_stitch_order(self.svg),
+                       'group_order': scan_group_order(self.svg),
                        'states': scan_states(self.svg)}, f)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))

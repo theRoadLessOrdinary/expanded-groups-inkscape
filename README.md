@@ -54,11 +54,20 @@ see its member objects as child rows.
 | Create a new group from the canvas selection | Toolbar "Assign To Group..." button (same as the menu item) |
 | Hide or show a whole group | Eye icon on the group row |
 | Lock or unlock a whole group | Lock icon on the group row |
+| Change the sewing order | Drag rows up or down inside Stitch Order |
+| Change the order groups are listed in | Drag a group row up or down |
+| Move an object to another group | Drag its row onto the other group, or onto one of that group's objects |
+| Add an object to another group and keep it in its own | Hold Ctrl while you drop it |
+| Drag several rows at once | Shift+click or Ctrl+click rows of the same kind, then drag one of them |
 
 The eye and lock icons also appear on each object row. Deleting a group or
 removing an object only removes the tag; it never deletes the object.
 
-There is no drag-and-drop and no nested groups. Groups are flat by design.
+There are no nested groups. Groups are flat by design.
+
+The group order is saved in the document, on the root `<svg>` element as
+`trlo:group_order`. Groups that were never dragged are listed after the
+others, alphabetically.
 
 ## How it works
 
@@ -86,12 +95,21 @@ URI, not by prefix.
   extensions synchronously and does not service its own event loop while
   waiting for the child, so a long-lived dialog launched the normal way
   would freeze the whole Inkscape window.
-- **The panel never writes the SVG file.** Every live change (select,
-  rename, remove, hide, lock) goes through Inkscape's own D-Bus Actions
-  interface (`select-by-id`, `object-set-attribute`, `object-set-property`,
-  `selection-lock`, and so on), the same actions Inkscape's menus call.
-  Edits land in Inkscape's in-memory document and are tracked correctly by
-  undo and unsaved-changes.
+- **The panel never writes the SVG file.** Every live change goes through
+  Inkscape's own D-Bus Actions interface, the same actions Inkscape's menus
+  call. Select, hide and lock use `select-by-id`, `object-set-property` and
+  `selection-lock`. Rename, delete, remove, moving objects between groups
+  and the group order run the hidden `group_apply.py` extension, which the
+  panel tells what to change through a small JSON file. Changes to the
+  stitch order run the Stitch Order extension's own actions (its hidden
+  Reorder action for a drag). Edits land in Inkscape's in-memory document
+  and are tracked correctly by undo and unsaved-changes; each change is one
+  undo step.
+- **Why not `object-set-attribute` for group names.** That action takes the
+  attribute name literally. Given `{namespace}group` it saves a broken
+  attribute, and a prefixed name like `trlo:group` only works when
+  Inkscape knows that prefix for the document (many files use `ns0:`).
+  An extension writes the attribute by namespace, whatever the prefix.
 - **Any installed extension is reachable over that same D-Bus interface**
   as an action named after its `.inx` id, with dots and underscores turned
   into hyphens (`trlo.assign_group` becomes `trlo.assign-group`). The
@@ -137,6 +155,7 @@ not expose in the same way.
 | `assign_group.inx` / `assign_group.py` | Assign To Group extension |
 | `expanded_groups.inx` / `expanded_groups.py` | Browse Groups launcher |
 | `expanded_groups_panel.py` | The detached GTK tree panel |
+| `group_apply.inx` / `group_apply.py` | Hidden extension the panel runs to apply group changes |
 | `expanded_groups_data.py` | Document scanning and group-name logic |
 | `expanded_groups_dbus.py` | Live D-Bus helpers |
 

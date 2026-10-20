@@ -24,6 +24,9 @@ inkex.NSS['trlo'] = GROUP_NS
 GROUP_ATTR = inkex.addNS('group', 'trlo')
 # Set by the Stitch Order extension (stitch-order/); shown here as its own entry.
 ORDER_ATTR = inkex.addNS('stitch_order', 'trlo')
+# On the root <svg>: the order the window lists groups in (dragged by the
+# user), "|"-separated. Groups not in it are listed after, alphabetically.
+GROUP_ORDER_ATTR = inkex.addNS('group_order', 'trlo')
 
 # An object can belong to more than one group at once, so trlo:group holds a
 # "|"-separated list of names (not comma or space -- a group name like
@@ -117,6 +120,12 @@ def scan_stitch_order(svg):
     return [node_id for _, _, node_id in sorted(numbered)]
 
 
+def scan_group_order(svg):
+    """The group names in the order the user dragged them into."""
+    value = svg.get(GROUP_ORDER_ATTR) or ''
+    return [n for n in (part.strip() for part in value.split(GROUP_SEP)) if n]
+
+
 def scan_states(svg):
     """{id: {'hidden': bool, 'locked': bool}} for every trlo:group node and
     every stitch-order node. Only the node's own display/lock state, not
@@ -155,6 +164,12 @@ PENDING_MAX_AGE = 30
 # Written by stitch_order.py after each change to the stitch order; the panel
 # polls it the same way as LAST_ASSIGN_PATH.
 ORDER_RECORD_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_last.json')
+# The panel writes a dragged stitch order here, then runs Stitch Order's
+# hidden Reorder action, which reads it (same file name as stitch_order.py).
+ORDER_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_pending.json')
+# Same handoff for group changes made in the panel (new group lists per
+# object, and the group order), read by group_apply.py.
+GROUP_APPLY_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_pending_apply.json')
 
 PANEL_PID_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel.pid')
 PANEL_FOCUS_REQUEST_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel_focus_request')
