@@ -63,12 +63,16 @@ import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 
+# Use Inkscape's window class so the taskbar groups this panel under the Inkscape icon
+GLib.set_prgname('org.inkscape.Inkscape')
+Gdk.set_program_class('Inkscape')
+
 from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
                                    ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.13.0"
+VERSION = "3.13.1"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05

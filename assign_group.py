@@ -25,7 +25,11 @@ os.environ.setdefault('NO_AT_BRIDGE', '1')
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk
+from gi.repository import Gtk, Gdk, GLib
+
+# Use Inkscape's window class so the taskbar groups this dialog under the Inkscape icon
+GLib.set_prgname('org.inkscape.Inkscape')
+Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (GROUP_SEP, LAST_ASSIGN_PATH, PENDING_MAX_AGE,
                                   PENDING_TARGET_PATH, add_group_name)
