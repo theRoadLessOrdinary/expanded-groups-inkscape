@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
+
+	<name>Expanded Groups Snapshot</name>
+	<id>trlo.groups_snapshot</id>
+
+	<effect needs-live-preview="false">
+		<object-type>all</object-type>
+		<effects-menu hidden="true" />
+	</effect>
+
+	<script>
+		<command location="inx" interpreter="python">groups_snapshot.py</command>
+	</script>
+
+</inkscape-extension>

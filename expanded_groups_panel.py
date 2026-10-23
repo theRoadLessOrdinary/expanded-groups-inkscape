@@ -68,11 +68,12 @@ GLib.set_prgname('org.inkscape.Inkscape')
 Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
+                                   EMBED_SNAPSHOT_ACTION,
                                    ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.13.1"
+VERSION = "3.14.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -108,7 +109,16 @@ INTO = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
 class ExpandedGroupsPanel:
 
     def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=(),
-                 labels=None):
+                 labels=None, host_window=None, status=None, snapshot_path=None):
+        # host_window set: the list is built into another window (the Map's
+        # Edge Tool Panel's Groups tab) instead of a window of its own. The
+        # host owns the window, its focus and closing; status (a function)
+        # shows messages in the host's status bar, and the list reloads
+        # whenever snapshot_path changes (Refresh writes a new one).
+        self.host_window = host_window
+        self.status_cb = status
+        self.snapshot_path = snapshot_path
+        self.snapshot_mtime = self._mtime(snapshot_path) if snapshot_path else 0
         self.labels = dict(labels or {})  # {id: Inkscape label}; rows show the label, else the id
         self.inkscape_pid = inkscape_pid  # the window closes when this process ends
         self.group_order = list(group_order)  # names in dragged order; others follow, sorted
@@ -125,7 +135,13 @@ class ExpandedGroupsPanel:
         self.pending_click = None    # the click to finish on release if no drag starts
         self.anchor_path = None      # where a Shift+click range starts
         with quiet_stderr():
-            self.build_dialog()
+            if host_window is None:
+                self.build_dialog()
+            else:
+                self.window = host_window
+                self.widget = self.build_content()
+                self.tree.connect("key-press-event", self.on_key_press)
+                GLib.timeout_add(500, self.poll_assign)
 
     def build_dialog(self):
         win = Gtk.Window(title=f"Expanded Groups v{VERSION}")
@@ -143,8 +159,13 @@ class ExpandedGroupsPanel:
         except OSError:
             pass
 
+        win.add(self.build_content())
+        win.show_all()
+        GLib.timeout_add(500, self.poll_assign)
+
+    def build_content(self):
+        """The toolbar and list (plus a status bar in a window of its own), as one box."""
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        win.add(vbox)
 
         toolbar = Gtk.Toolbar()
         assign_btn = Gtk.ToolButton()
@@ -166,6 +187,13 @@ class ExpandedGroupsPanel:
         delete_btn.set_tooltip_text("Delete selected group, or remove selected object from its group")
         delete_btn.connect("clicked", lambda b: self.delete_selected())
         toolbar.insert(delete_btn, -1)
+
+        if self.host_window is not None:
+            refresh_btn = Gtk.ToolButton()
+            refresh_btn.set_icon_name("view-refresh")
+            refresh_btn.set_tooltip_text("Read the groups from the document again")
+            refresh_btn.connect("clicked", lambda b: self.request_snapshot())
+            toolbar.insert(refresh_btn, -1)
         vbox.pack_start(toolbar, False, False, 0)
 
         self.store = Gtk.TreeStore(str, str, str, str, str, str)
@@ -205,13 +233,32 @@ class ExpandedGroupsPanel:
         scroll.add(self.tree)
         vbox.pack_start(scroll, True, True, 0)
 
-        self.statusbar = Gtk.Statusbar()
-        self.status_ctx = self.statusbar.get_context_id("main")
-        vbox.pack_start(self.statusbar, False, False, 0)
+        if self.status_cb is None:
+            self.statusbar = Gtk.Statusbar()
+            self.status_ctx = self.statusbar.get_context_id("main")
+            vbox.pack_start(self.statusbar, False, False, 0)
 
         self.refresh_tree()
-        win.show_all()
-        GLib.timeout_add(500, self.poll_assign)
+        return vbox
+
+    def request_snapshot(self):
+        """Ask Inkscape to write the document's groups again; poll_assign loads them."""
+        if run_extension_live(EMBED_SNAPSHOT_ACTION):
+            self.show_status("Reading groups from the document...")
+        else:
+            self.show_status("Could not reach Inkscape to read the groups")
+
+    def load_snapshot(self, snap):
+        """Replace the whole model with a fresh read of the document."""
+        expanded = self._expanded_groups()
+        self.by_name = snap.get('by_name', {})
+        self.by_id = snap.get('by_id', {})
+        self.states = snap.get('states', {})
+        self.stitch_order = list(snap.get('stitch_order', []))
+        self.group_order = list(snap.get('group_order', []))
+        self.labels = dict(snap.get('labels', {}))
+        self.refresh_tree()
+        self._restore_expanded(expanded)
 
     def on_destroy(self, *args):
         try:
@@ -228,6 +275,9 @@ class ExpandedGroupsPanel:
         return column
 
     def show_status(self, msg):
+        if self.status_cb is not None:
+            self.status_cb(msg)
+            return
         self.statusbar.pop(self.status_ctx)
         self.statusbar.push(self.status_ctx, msg)
 
@@ -283,7 +333,20 @@ class ExpandedGroupsPanel:
         return False
 
     def poll_assign(self):
-        if self.inkscape_gone():
+        if self.host_window is not None:
+            # Built into another window: that window handles Inkscape closing
+            # and focus requests. Reload when a new snapshot has been written.
+            if self.snapshot_path:
+                mtime = self._mtime(self.snapshot_path)
+                if mtime != self.snapshot_mtime:
+                    self.snapshot_mtime = mtime
+                    try:
+                        with open(self.snapshot_path) as f:
+                            self.load_snapshot(json.load(f))
+                        self.show_status(f"Groups: {len(self.by_name)}")
+                    except (OSError, ValueError):
+                        pass
+        elif self.inkscape_gone():
             self.window.destroy()
             return False
         # Also checked here (same 500ms tick) rather than a separate timer:
@@ -291,7 +354,7 @@ class ExpandedGroupsPanel:
         # a second panel when one is already open, and this is how that
         # request reaches the existing window.
         focus_mtime = self._focus_mtime()
-        if focus_mtime != self.last_focus_mtime:
+        if self.host_window is None and focus_mtime != self.last_focus_mtime:
             self.last_focus_mtime = focus_mtime
             self.window.present()
 

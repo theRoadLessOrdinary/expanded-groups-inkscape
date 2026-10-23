@@ -71,6 +71,10 @@ The group order is saved in the document, on the root `<svg>` element as
 `trlo:group_order`. Groups that were never dragged are listed after the
 others, alphabetically.
 
+### In the Map's Edge Tool Panel
+
+The same list also sits in the Map's Edge Tool Panel, under **General > Groups**, so it can stay in one window with the other tools. It works the same way and adds a Refresh button, which reads the groups from the document again (through the hidden `groups_snapshot` extension). The menu's Browse Groups... still opens the list in a window of its own.
+
 ## How it works
 
 Membership is stored as a `trlo:group` attribute (a `|`-separated list of

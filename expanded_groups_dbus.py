@@ -68,13 +68,13 @@ DBUS_NAME = 'org.inkscape.Inkscape'
 DBUS_PATH = '/org/inkscape/Inkscape'
 
 
-def _activate_live(action_name, *string_args):
+def _activate_live(action_name, *string_args, timeout=-1):
     conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     params = [GLib.Variant('s', s) for s in string_args]
     conn.call_sync(
         DBUS_NAME, DBUS_PATH, 'org.gtk.Actions', 'Activate',
         GLib.Variant('(sava{sv})', (action_name, params, {})),
-        None, Gio.DBusCallFlags.NONE, -1, None,
+        None, Gio.DBusCallFlags.NONE, timeout, None,
     )
 
 
@@ -111,9 +111,11 @@ def set_attribute_live(attr_name, attr_value):
 
 def run_extension_live(action_name):
     """Run an installed extension in the live window, as if chosen from the
-    Extensions menu (e.g. 'trlo.assign-group.noprefs')."""
+    Extensions menu (e.g. 'trlo.assign-group.noprefs'). Waits as long as the
+    extension takes: the default D-Bus limit of 25 s is shorter than some
+    tools run, and an error dialog left open holds the call too."""
     try:
-        _activate_live(action_name)
+        _activate_live(action_name, timeout=GLib.MAXINT)
     except GLib.Error as e:
         inkex.errormsg(f"Could not run {action_name} in the live Inkscape window: {e}")
         return False

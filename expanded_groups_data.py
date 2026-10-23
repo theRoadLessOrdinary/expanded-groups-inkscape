@@ -13,6 +13,7 @@ assign_group.py, which do need gi and so suppress the warning explicitly.
 """
 
 import inkex
+import json
 import os
 import tempfile
 
@@ -152,6 +153,31 @@ def scan_states(svg):
             'locked': node.get('sodipodi:insensitive') == 'true',
         }
     return states
+
+
+def snapshot(svg):
+    """Everything the groups list needs from the document, as plain data."""
+    by_name, by_id = scan_groups_by_id(svg)
+    return {'by_name': by_name, 'by_id': by_id,
+            'stitch_order': scan_stitch_order(svg),
+            'group_order': scan_group_order(svg),
+            'labels': scan_labels(svg),
+            'states': scan_states(svg)}
+
+
+def write_snapshot(svg, path):
+    """Write snapshot(svg) to path in one step, so a reader never sees half a file."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(snapshot(svg), f)
+    os.replace(tmp, path)
+
+
+# The Map's Edge Tool Panel shows the groups list in its own Groups tab.
+# tool_panel.py and groups_snapshot.py write the document's groups here,
+# and the panel reloads its list whenever this file changes.
+EMBED_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), 'maps_edge_panel_groups.json')
+EMBED_SNAPSHOT_ACTION = 'trlo.groups-snapshot.noprefs'
 
 
 # assign_group.py records what it just did here so an open browse panel (a

@@ -19,8 +19,7 @@ import sys
 import tempfile
 import time
 
-from expanded_groups_data import (scan_groups_by_id, scan_states, scan_stitch_order, scan_group_order, scan_labels,
-                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH)
+from expanded_groups_data import snapshot, PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH
 
 VERSION = "2.4.0"
 
@@ -126,15 +125,9 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
             request_panel_focus()
             return
 
-        by_name, by_id = scan_groups_by_id(self.svg)
-
         fd, snapshot_path = tempfile.mkstemp(prefix='expanded_groups_', suffix='.json')
         with os.fdopen(fd, 'w') as f:
-            json.dump({'by_name': by_name, 'by_id': by_id,
-                       'stitch_order': scan_stitch_order(self.svg),
-                       'group_order': scan_group_order(self.svg),
-                       'labels': scan_labels(self.svg),
-                       'states': scan_states(self.svg)}, f)
+            json.dump(snapshot(self.svg), f)
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         panel_script = os.path.join(script_dir, 'expanded_groups_panel.py')
