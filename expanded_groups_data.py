@@ -311,3 +311,8 @@ STYLES_RECORD_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_styles
 
 PANEL_PID_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel.pid')
 PANEL_FOCUS_REQUEST_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel_focus_request')
+
+# The list's Highlight Selected button runs selection_report.py, which
+# writes the canvas selection's ids here for the list to read.
+SELECTION_REPORT_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_selection.json')
+SELECTION_REPORT_ACTION = 'trlo.selection-report.noprefs'

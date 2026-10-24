@@ -70,10 +70,11 @@ Gdk.set_program_class('Inkscape')
 from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
                                    EMBED_SNAPSHOT_ACTION,
                                    ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH, STYLES_RECORD_PATH,
-                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
+                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names,
+                                   SELECTION_REPORT_PATH, SELECTION_REPORT_ACTION)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.16.0"
+VERSION = "3.17.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -147,7 +148,7 @@ class ExpandedGroupsPanel:
 
     def build_dialog(self):
         win = Gtk.Window(title=f"Expanded Groups v{VERSION}")
-        win.set_default_size(320, 460)
+        win.set_default_size(360, 460)
         win.connect("destroy", self.on_destroy)
         win.connect("key-press-event", self.on_key_press)
         self.window = win
@@ -189,6 +190,12 @@ class ExpandedGroupsPanel:
         delete_btn.set_tooltip_text("Delete selected group, or remove selected object from its group")
         delete_btn.connect("clicked", lambda b: self.delete_selected())
         toolbar.insert(delete_btn, -1)
+
+        highlight_btn = Gtk.ToolButton()
+        highlight_btn.set_icon_name("edit-find")
+        highlight_btn.set_tooltip_text("Highlight Selected: select the rows of the objects selected on the canvas")
+        highlight_btn.connect("clicked", lambda b: self.highlight_canvas_selection())
+        toolbar.insert(highlight_btn, -1)
 
         if self.host_window is not None:
             refresh_btn = Gtk.ToolButton()
@@ -634,6 +641,49 @@ class ExpandedGroupsPanel:
                     ids.append(node_id)
         select_by_id_live(ids)
         self.show_status(f"Selected {len(ids)} object(s) in {len(paths)} row(s)")
+
+    def highlight_canvas_selection(self):
+        """Select the rows of the objects selected on the canvas (Inkscape
+        can't tell this window when its selection changes, so it is asked)."""
+        try:
+            os.remove(SELECTION_REPORT_PATH)
+        except OSError:
+            pass
+        if not run_extension_live(SELECTION_REPORT_ACTION):
+            self.show_status("Could not reach Inkscape to read its selection")
+            return
+        try:
+            with open(SELECTION_REPORT_PATH) as f:
+                wanted = set(json.load(f).get('ids', []))
+        except (OSError, ValueError):
+            self.show_status("Could not read Inkscape's selection")
+            return
+        if not wanted:
+            self.show_status("Nothing is selected on the canvas")
+            return
+        selection = self.tree.get_selection()
+        selection.unselect_all()
+        self.anchor_path = None
+        found, first = set(), None
+        it = self.store.get_iter_first()
+        while it is not None:
+            child = self.store.iter_children(it)
+            while child is not None:
+                node_id = self.store[child][COL_ID]
+                if node_id in wanted:
+                    path = self.store.get_path(child)
+                    self.tree.expand_to_path(path)
+                    selection.select_iter(child)
+                    found.add(node_id)
+                    if first is None:
+                        first = path
+                child = self.store.iter_next(child)
+            it = self.store.iter_next(it)
+        if first is None:
+            self.show_status("None of the selected objects is in a group or the Stitch Order")
+            return
+        self.tree.scroll_to_cell(first, None, True, 0.3, 0)
+        self.show_status(f"Highlighted {len(found)} selected object(s)")
 
     # -- click to select / double-click to rename -------------------------
 
