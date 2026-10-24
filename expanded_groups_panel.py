@@ -69,11 +69,11 @@ Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
                                    EMBED_SNAPSHOT_ACTION,
-                                   ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH,
+                                   ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH, STYLES_RECORD_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.14.0"
+VERSION = "3.15.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -109,7 +109,7 @@ INTO = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
 class ExpandedGroupsPanel:
 
     def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=(),
-                 labels=None, host_window=None, status=None, snapshot_path=None):
+                 labels=None, host_window=None, status=None, snapshot_path=None, group_styles=None):
         # host_window set: the list is built into another window (the Map's
         # Edge Tool Panel's Groups tab) instead of a window of its own. The
         # host owns the window, its focus and closing; status (a function)
@@ -126,6 +126,8 @@ class ExpandedGroupsPanel:
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
         self.stitch_order = list(stitch_order)  # [id, ...] in sewing order
+        self.group_styles = dict(group_styles or {})  # {group name: {property: value}}
+        self.last_styles_mtime = self._mtime(STYLES_RECORD_PATH)
         self.last_assign_mtime = self._assign_mtime()
         self.last_order_mtime = self._mtime(ORDER_RECORD_PATH)
         self.last_focus_mtime = self._focus_mtime()
@@ -256,6 +258,7 @@ class ExpandedGroupsPanel:
         self.states = snap.get('states', {})
         self.stitch_order = list(snap.get('stitch_order', []))
         self.group_order = list(snap.get('group_order', []))
+        self.group_styles = dict(snap.get('group_styles', {}))
         self.labels = dict(snap.get('labels', {}))
         self.refresh_tree()
         self._restore_expanded(expanded)
@@ -372,6 +375,16 @@ class ExpandedGroupsPanel:
                 self._restore_expanded(expanded)
                 self.show_status(f"Stitch order: {len(self.stitch_order)} object(s)")
             except (OSError, ValueError, KeyError):
+                pass
+
+        # group_apply.py leaves the group styles after it changes one.
+        styles_mtime = self._mtime(STYLES_RECORD_PATH)
+        if styles_mtime != self.last_styles_mtime:
+            self.last_styles_mtime = styles_mtime
+            try:
+                with open(STYLES_RECORD_PATH) as f:
+                    self.group_styles = dict(json.load(f)['styles'])
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
 
         # assign_group.py leaves a record of each run; fold it into this
@@ -743,8 +756,11 @@ class ExpandedGroupsPanel:
             changes[node_id] = merge_names(self.by_id[node_id], rename_from=old_name, rename_to=new_name)
         if old_name in self.group_order:
             self.group_order = [new_name if n == old_name else n for n in self.group_order]
-        if not self.apply_groups(changes, with_order=True):
+        if not self.apply_groups(changes, with_order=True,
+                                 extra={'rename_style': [old_name, new_name]}):
             return
+        if old_name in self.group_styles:
+            self.group_styles.setdefault(new_name, self.group_styles.pop(old_name))
         self.refresh_tree(renamed=(old_name, new_name))
         self.show_status(f"Renamed “{old_name}” to “{new_name}”")
 
@@ -782,8 +798,11 @@ class ExpandedGroupsPanel:
             for name in names:
                 remaining = merge_names(remaining, remove=name)
             changes[node_id] = remaining
-        if not self.apply_groups(changes):
+        styled = [n for n in names if n in self.group_styles]
+        if not self.apply_groups(changes, extra={'drop_styles': styled} if styled else None):
             return
+        for name in styled:
+            self.group_styles.pop(name, None)
         self.refresh_tree()
         if len(names) == 1:
             self.show_status(f"Deleted “{names[0]}”")
@@ -975,18 +994,20 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded)
         self.show_status("Stitch order changed")
 
-    def apply_groups(self, changes, with_order=False):
+    def apply_groups(self, changes, with_order=False, extra=None):
         """Write new group lists ({id: [name, ...]}) and, if asked, the
         group order into the open document in one step (one undo), then
-        update this window's model to match."""
+        update this window's model to match. extra holds style requests
+        for group_apply.py (see its docstring)."""
         changes = {i: names for i, names in changes.items() if names != self.by_id.get(i, [])}
-        if not changes and not with_order:
+        if not changes and not with_order and not extra:
             return True
         updated = dict(self.by_id)
         updated.update(changes)
         self.by_id = updated
         self.rebuild_by_name()
         rec = {'members': changes, 'time': time.time()}
+        rec.update(extra or {})
         if with_order:
             rec['order'] = self.ordered_group_names()
         with open(GROUP_APPLY_PENDING_PATH, 'w') as f:
@@ -1017,6 +1038,21 @@ class ExpandedGroupsPanel:
         self._restore_expanded(expanded | {target})
         verb = "Added" if copy else "Moved"
         self.show_status(f"{verb} {len(changes)} object(s) to “{target}”")
+
+    def group_style(self, name, request):
+        """Set, reapply or clear a group's fill and stroke. Set takes them
+        from the object selected on the canvas; group_apply.py does the work
+        and leaves the new styles for poll_assign."""
+        if not self.apply_groups({}, extra={request: name}):
+            self.show_status("Could not reach Inkscape")
+            return
+        if request == 'clear_style':
+            self.group_styles.pop(name, None)
+            self.show_status(f"“{name}” has no style now; its objects keep theirs")
+        elif request == 'reapply_style':
+            self.show_status(f"Style of “{name}” put on its objects again")
+        else:
+            self.show_status(f"Style of “{name}” set from the selection")
 
     # -- context menu / keyboard -------------------------------------------
 
@@ -1055,6 +1091,11 @@ class ExpandedGroupsPanel:
         elif kinds == {"group"}:
             if single:
                 add(f"Add Selection to “{item_id}”", lambda: self.assign_selection_to(item_id))
+                menu.append(Gtk.SeparatorMenuItem())
+                add("Set Style from Selection", lambda: self.group_style(item_id, 'set_style'))
+                if item_id in self.group_styles:
+                    add("Reapply Style", lambda: self.group_style(item_id, 'reapply_style'))
+                    add("Clear Style", lambda: self.group_style(item_id, 'clear_style'))
                 menu.append(Gtk.SeparatorMenuItem())
                 add("Rename", lambda: self.start_rename(path))
                 menu.append(Gtk.SeparatorMenuItem())
@@ -1108,7 +1149,8 @@ def main():
         inkscape_pid = None
     ExpandedGroupsPanel(snapshot.get('by_name', {}), snapshot.get('by_id', {}),
                         snapshot.get('states', {}), snapshot.get('stitch_order', []),
-                        inkscape_pid, snapshot.get('group_order', []), snapshot.get('labels', {}))
+                        inkscape_pid, snapshot.get('group_order', []), snapshot.get('labels', {}),
+                        group_styles=snapshot.get('group_styles', {}))
     Gtk.main()
 
 

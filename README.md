@@ -71,6 +71,25 @@ The group order is saved in the document, on the root `<svg>` element as
 `trlo:group_order`. Groups that were never dragged are listed after the
 others, alphabetically.
 
+### Group styles
+
+A group can carry a fill and stroke. Style one object the way you want it
+(with Inkscape's Fill and Stroke dialog), select it on the canvas, then
+right-click the group and choose **Set Style from Selection**. Every object
+in the group takes that fill and stroke, and so does any object added to the
+group later (Assign To Group, Add Selection, or a drag). On a native group,
+the style goes on every shape inside it.
+
+- An object in more than one styled group has the style of the group it
+  most recently got a style from.
+- Taking an object out of a group leaves its style as it is.
+- **Reapply Style** puts the group's style back on all its objects.
+- **Clear Style** forgets the group's style; the objects keep theirs.
+- Renaming a group keeps its style; deleting a group drops it.
+
+The styles are saved in the document, on the root `<svg>`, as
+`trlo:group_styles`.
+
 ### In the Map's Edge Tool Panel
 
 The same list also sits in the Map's Edge Tool Panel, under **General > Groups**, so it can stay in one window with the other tools. It works the same way and adds a Refresh button, which reads the groups from the document again (through the hidden `groups_snapshot` extension). The menu's Browse Groups... still opens the list in a window of its own.

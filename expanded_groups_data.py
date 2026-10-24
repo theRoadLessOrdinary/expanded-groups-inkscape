@@ -28,6 +28,17 @@ ORDER_ATTR = inkex.addNS('stitch_order', 'trlo')
 # On the root <svg>: the order the window lists groups in (dragged by the
 # user), "|"-separated. Groups not in it are listed after, alphabetically.
 GROUP_ORDER_ATTR = inkex.addNS('group_order', 'trlo')
+# On the root <svg>: each styled group's fill and stroke, as JSON
+# {group name: {property: value}}. Objects get it when the style is set
+# and whenever they are added to the group; the latest one applied wins.
+# Taking an object out of a group leaves its style as it is.
+GROUP_STYLES_ATTR = inkex.addNS('group_styles', 'trlo')
+# The properties a group style carries. Fill and stroke are always taken
+# (black and none when the source object doesn't set them); the rest only
+# when the source object sets them.
+STYLE_PROPS = ('fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-opacity',
+               'stroke-width', 'stroke-dasharray', 'stroke-dashoffset',
+               'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit', 'paint-order')
 
 # An object can belong to more than one group at once, so trlo:group holds a
 # "|"-separated list of names (not comma or space -- a group name like
@@ -138,6 +149,54 @@ def scan_group_order(svg):
     return [n for n in (part.strip() for part in value.split(GROUP_SEP)) if n]
 
 
+def get_group_styles(svg):
+    """{group name: {property: value}} stored on the root <svg>."""
+    try:
+        styles = json.loads(svg.get(GROUP_STYLES_ATTR) or '{}')
+    except ValueError:
+        return {}
+    return styles if isinstance(styles, dict) else {}
+
+
+def set_group_styles(svg, styles):
+    styles = {name: style for name, style in styles.items() if style}
+    if styles:
+        svg.set(GROUP_STYLES_ATTR, json.dumps(styles, sort_keys=True))
+    else:
+        svg.attrib.pop(GROUP_STYLES_ATTR, None)
+
+
+def style_from(node):
+    """The fill and stroke a group takes from an object. A native group
+    gives the style of the first shape inside it."""
+    if isinstance(node, inkex.Group):
+        shapes = [d for d in node.descendants() if isinstance(d, inkex.ShapeElement)
+                  and not isinstance(d, inkex.Group)]
+        if not shapes:
+            return None
+        node = shapes[0]
+    specified = node.specified_style()
+    style = {'fill': specified.get('fill') or 'black',
+             'stroke': specified.get('stroke') or 'none'}
+    for prop in STYLE_PROPS:
+        if prop not in style and specified.get(prop) is not None:
+            style[prop] = specified.get(prop)
+    return style
+
+
+def apply_style(node, style):
+    """Put a group style on an object. On a native group it goes on every
+    shape inside it, as Inkscape's own Fill and Stroke does."""
+    if isinstance(node, inkex.Group):
+        targets = [d for d in node.descendants() if isinstance(d, inkex.ShapeElement)
+                   and not isinstance(d, inkex.Group)]
+    else:
+        targets = [node]
+    for target in targets:
+        for prop, value in style.items():
+            target.style[prop] = value
+
+
 def scan_states(svg):
     """{id: {'hidden': bool, 'locked': bool}} for every trlo:group node and
     every stitch-order node. Only the node's own display/lock state, not
@@ -161,6 +220,7 @@ def snapshot(svg):
     return {'by_name': by_name, 'by_id': by_id,
             'stitch_order': scan_stitch_order(svg),
             'group_order': scan_group_order(svg),
+            'group_styles': get_group_styles(svg),
             'labels': scan_labels(svg),
             'states': scan_states(svg)}
 
@@ -207,6 +267,9 @@ ORDER_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_pending.j
 # Same handoff for group changes made in the panel (new group lists per
 # object, and the group order), read by group_apply.py.
 GROUP_APPLY_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_pending_apply.json')
+# group_apply.py writes the document's group styles here after it changes
+# one, and the window polls it to know which groups have a style.
+STYLES_RECORD_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_styles.json')
 
 PANEL_PID_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel.pid')
 PANEL_FOCUS_REQUEST_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_panel_focus_request')

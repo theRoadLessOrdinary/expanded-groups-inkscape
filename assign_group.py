@@ -32,7 +32,8 @@ GLib.set_prgname('org.inkscape.Inkscape')
 Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (GROUP_SEP, LAST_ASSIGN_PATH, PENDING_MAX_AGE,
-                                  PENDING_TARGET_PATH, add_group_name)
+                                  PENDING_TARGET_PATH, add_group_name, get_group_names,
+                                  get_group_styles, apply_style)
 from expanded_groups_dbus import quiet_stderr
 
 
@@ -56,9 +57,13 @@ class AssignGroup(inkex.EffectExtension):
             inkex.errormsg(f'Group names can\'t contain "{GROUP_SEP}".')
             return
 
+        # Objects joining a styled group take its style.
+        style = get_group_styles(self.svg).get(name)
         for node in selected:
             if node.get('id') is None:
                 node.set('id', self.svg.get_unique_id('object'))
+            if style and name not in get_group_names(node):
+                apply_style(node, style)
             add_group_name(node, name)
 
         with open(LAST_ASSIGN_PATH, 'w') as f:
