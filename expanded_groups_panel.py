@@ -73,7 +73,7 @@ from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_R
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.15.0"
+VERSION = "3.16.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05

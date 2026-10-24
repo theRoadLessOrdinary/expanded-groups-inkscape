@@ -14,6 +14,7 @@ assign_group.py, which do need gi and so suppress the warning explicitly.
 
 import inkex
 import json
+import math
 import os
 import tempfile
 
@@ -36,6 +37,9 @@ GROUP_STYLES_ATTR = inkex.addNS('group_styles', 'trlo')
 # The properties a group style carries. Fill and stroke are always taken
 # (black and none when the source object doesn't set them); the rest only
 # when the source object sets them.
+# Lengths (stroke width, dashes) are stored as they look on the page, in
+# document units, and each object gets the number that looks that wide
+# through its own scaling (its transform and its parents').
 STYLE_PROPS = ('fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-opacity',
                'stroke-width', 'stroke-dasharray', 'stroke-dashoffset',
                'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit', 'paint-order')
@@ -166,6 +170,37 @@ def set_group_styles(svg, styles):
         svg.attrib.pop(GROUP_STYLES_ATTR, None)
 
 
+LENGTH_PROPS = ('stroke-width', 'stroke-dashoffset', 'stroke-dasharray')
+
+
+def _scale(node):
+    """How much an object's transforms (its own and its parents') enlarge
+    a length drawn on it."""
+    t = node.composed_transform()
+    return math.sqrt(abs(t.a * t.d - t.b * t.c)) or 1.0
+
+
+def _scale_lengths(svg, prop, value, factor):
+    """A stroke width or dash value multiplied by factor, in document
+    units. Percentages and keywords like "none" are left alone."""
+    if prop not in LENGTH_PROPS or value is None:
+        return value
+    parts = str(value).replace(',', ' ').split()
+    if not parts or any(p.endswith('%') or p[0].isalpha() for p in parts):
+        return value
+    def user_units(text):
+        # A bare number is already in user units; unittouu would read it as px.
+        try:
+            return float(text)
+        except ValueError:
+            return svg.unittouu(text)
+    try:
+        nums = [user_units(p) * factor for p in parts]
+    except (ValueError, TypeError):
+        return value
+    return ' '.join(f"{n:.6g}" for n in nums) if prop == 'stroke-dasharray' else f"{nums[0]:.6g}"
+
+
 def style_from(node):
     """The fill and stroke a group takes from an object. A native group
     gives the style of the first shape inside it."""
@@ -181,7 +216,9 @@ def style_from(node):
     for prop in STYLE_PROPS:
         if prop not in style and specified.get(prop) is not None:
             style[prop] = specified.get(prop)
-    return style
+    svg = node.root
+    factor = _scale(node)
+    return {prop: _scale_lengths(svg, prop, value, factor) for prop, value in style.items()}
 
 
 def apply_style(node, style):
@@ -193,8 +230,9 @@ def apply_style(node, style):
     else:
         targets = [node]
     for target in targets:
+        factor = 1.0 / _scale(target)
         for prop, value in style.items():
-            target.style[prop] = value
+            target.style[prop] = _scale_lengths(target.root, prop, value, factor)
 
 
 def scan_states(svg):

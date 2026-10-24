@@ -86,6 +86,9 @@ the style goes on every shape inside it.
 - **Reapply Style** puts the group's style back on all its objects.
 - **Clear Style** forgets the group's style; the objects keep theirs.
 - Renaming a group keeps its style; deleting a group drops it.
+- Stroke width and dashes look the same on every object, whatever its
+  scaling: each object gets the number that draws as wide as the source
+  object's stroke looks on the page.
 
 The styles are saved in the document, on the root `<svg>`, as
 `trlo:group_styles`.
