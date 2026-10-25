@@ -33,7 +33,8 @@ Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (GROUP_SEP, LAST_ASSIGN_PATH, PENDING_MAX_AGE,
                                   PENDING_TARGET_PATH, add_group_name, get_group_names,
-                                  get_group_styles, apply_style)
+                                  get_group_styles, apply_style, group_states,
+                                  take_group_state, node_state)
 from expanded_groups_dbus import quiet_stderr
 
 
@@ -57,18 +58,24 @@ class AssignGroup(inkex.EffectExtension):
             inkex.errormsg(f'Group names can\'t contain "{GROUP_SEP}".')
             return
 
-        # Objects joining a styled group take its style.
+        # Objects joining a styled group take its style. Objects joining a
+        # group whose members are all hidden (or all locked) are hidden (or
+        # locked) too, so the group's eye and lock icons stay as they were.
         style = get_group_styles(self.svg).get(name)
+        state = group_states(self.svg).get(name)
         for node in selected:
             if node.get('id') is None:
                 node.set('id', self.svg.get_unique_id('object'))
-            if style and name not in get_group_names(node):
-                apply_style(node, style)
+            if name not in get_group_names(node):
+                if style:
+                    apply_style(node, style)
+                take_group_state(node, state)
             add_group_name(node, name)
 
         with open(LAST_ASSIGN_PATH, 'w') as f:
             json.dump({'name': name, 'ids': [n.get('id') for n in selected],
-                       'labels': {n.get('id'): n.label for n in selected if n.label}}, f)
+                       'labels': {n.get('id'): n.label for n in selected if n.label},
+                       'states': {n.get('id'): node_state(n) for n in selected}}, f)
 
     def pending_target(self):
         """Group name left by the browse panel's context menu, if fresh.

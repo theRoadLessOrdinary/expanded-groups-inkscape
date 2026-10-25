@@ -29,6 +29,11 @@ ORDER_ATTR = inkex.addNS('stitch_order', 'trlo')
 # On the root <svg>: the order the window lists groups in (dragged by the
 # user), "|"-separated. Groups not in it are listed after, alphabetically.
 GROUP_ORDER_ATTR = inkex.addNS('group_order', 'trlo')
+# On the root <svg>: the order the window lists each group's objects in
+# (dragged by the user), as JSON {group name: [id, ...]}. List order only;
+# the drawing order of the objects never changes. Objects not in it follow,
+# in document order.
+ITEM_ORDER_ATTR = inkex.addNS('item_order', 'trlo')
 # On the root <svg>: each styled group's fill and stroke, as JSON
 # {group name: {property: value}}. Objects get it when the style is set
 # and whenever they are added to the group; the latest one applied wins.
@@ -153,6 +158,36 @@ def scan_group_order(svg):
     return [n for n in (part.strip() for part in value.split(GROUP_SEP)) if n]
 
 
+def get_item_order(svg):
+    """{group name: [id, ...]} stored on the root <svg>."""
+    try:
+        order = json.loads(svg.get(ITEM_ORDER_ATTR) or '{}')
+    except ValueError:
+        return {}
+    if not isinstance(order, dict):
+        return {}
+    return {name: [i for i in ids if isinstance(i, str)]
+            for name, ids in order.items() if isinstance(ids, list)}
+
+
+def set_item_order(svg, order):
+    order = {name: ids for name, ids in order.items() if ids}
+    if order:
+        svg.set(ITEM_ORDER_ATTR, json.dumps(order, sort_keys=True))
+    else:
+        svg.attrib.pop(ITEM_ORDER_ATTR, None)
+
+
+def ordered_members(members, stored):
+    """A group's member ids in the stored order: the stored ids that are
+    still members come first, then the other members as given (document
+    order). Stored ids that are gone or left the group are skipped."""
+    present = set(members)
+    first = [i for i in dict.fromkeys(stored or ()) if i in present]
+    placed = set(first)
+    return first + [i for i in members if i not in placed]
+
+
 def get_group_styles(svg):
     """{group name: {property: value}} stored on the root <svg>."""
     try:
@@ -252,12 +287,49 @@ def scan_states(svg):
     return states
 
 
+def node_state(node):
+    """{'hidden': bool, 'locked': bool} for one node, read the same way as
+    scan_states: its own display:none and sodipodi:insensitive only."""
+    display = node.style.get('display') if hasattr(node, 'style') else None
+    return {'hidden': display == 'none',
+            'locked': node.get('sodipodi:insensitive') == 'true'}
+
+
+def group_states(svg):
+    """{group name: {'hidden': bool, 'locked': bool}}, where hidden means
+    every member is hidden and locked means every member is locked. Groups
+    with no members are left out. Read this before adding objects, so the
+    objects joining a group can take on its state."""
+    result = {}
+    for name, nodes in scan_groups(svg).items():
+        states = [node_state(n) for n in nodes]
+        if states:
+            result[name] = {'hidden': all(s['hidden'] for s in states),
+                            'locked': all(s['locked'] for s in states)}
+    return result
+
+
+def take_group_state(node, state):
+    """Hide and/or lock an object joining a group that is fully hidden
+    and/or fully locked. Done the way the panel's eye and lock buttons do
+    it (Inkscape's object-set-property display,none and selection-lock),
+    so showing or unlocking it later works the same as for any other
+    member. Never shows or unlocks anything."""
+    if not state:
+        return
+    if state.get('hidden'):
+        node.style['display'] = 'none'
+    if state.get('locked'):
+        node.set('sodipodi:insensitive', 'true')
+
+
 def snapshot(svg):
     """Everything the groups list needs from the document, as plain data."""
     by_name, by_id = scan_groups_by_id(svg)
     return {'by_name': by_name, 'by_id': by_id,
             'stitch_order': scan_stitch_order(svg),
             'group_order': scan_group_order(svg),
+            'item_order': get_item_order(svg),
             'group_styles': get_group_styles(svg),
             'labels': scan_labels(svg),
             'states': scan_states(svg)}
@@ -271,9 +343,11 @@ def write_snapshot(svg, path):
     os.replace(tmp, path)
 
 
-# The Map's Edge Tool Panel shows the groups list in its own Groups tab.
-# tool_panel.py and groups_snapshot.py write the document's groups here,
-# and the panel reloads its list whenever this file changes.
+# The document's groups as last read. tool_panel.py, groups_snapshot.py
+# (the Refresh button), the Browse Groups launcher (when its window is
+# already open) and group_apply.py (after each change) write it, and both
+# the Tool Panel's Groups tab and the Expanded Groups window reload their
+# list whenever it changes. Objects deleted on the canvas drop out then.
 EMBED_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), 'maps_edge_panel_groups.json')
 EMBED_SNAPSHOT_ACTION = 'trlo.groups-snapshot.noprefs'
 

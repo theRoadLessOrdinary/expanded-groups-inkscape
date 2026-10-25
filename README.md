@@ -56,6 +56,7 @@ see its member objects as child rows.
 | Lock or unlock a whole group | Lock icon on the group row |
 | Change the sewing order | Drag rows up or down inside Stitch Order |
 | Change the order groups are listed in | Drag a group row up or down |
+| Change the order objects are listed in inside a group | Drag an object row up or down inside its own group (the drawing order does not change) |
 | Move an object to another group | Drag its row onto the other group, or onto one of that group's objects |
 | Add an object to another group and keep it in its own | Hold Ctrl while you drop it |
 | Select several rows | Ctrl+click adds or removes one row; Shift+click selects every row from the last one clicked |
@@ -65,11 +66,27 @@ see its member objects as child rows.
 The eye and lock icons also appear on each object row. Deleting a group or
 removing an object only removes the tag; it never deletes the object.
 
+A group's eye shows hidden only when every object in it is hidden, and its
+lock shows locked only when every object in it is locked. An object added
+to a group (Add Selection, Assign To Group, a drag, or a Ctrl drop) takes on
+that state: if every object already in the group is hidden, the new object
+is hidden too, and if every object is locked, it is locked too. If the group
+is mixed, empty, or new, the added object keeps its own state. Adding and
+hiding or locking are one undo step, and showing or unlocking the group
+later shows or unlocks the added objects with the rest.
+
 There are no nested groups. Groups are flat by design.
 
 The group order is saved in the document, on the root `<svg>` element as
 `trlo:group_order`. Groups that were never dragged are listed after the
 others, alphabetically.
+
+The order of the objects inside each group is saved the same way, as
+`trlo:item_order` on the root `<svg>` (JSON, `{group name: [object id, ...]}`).
+It changes only the list, never the drawing: z-order and document order stay
+as they were. Objects that were never dragged are listed after the others,
+in document order. Renaming a group keeps its object order; deleting a group
+drops it. Each reorder is one undo step.
 
 ### Group styles
 
@@ -95,7 +112,11 @@ The styles are saved in the document, on the root `<svg>`, as
 
 ### In the Map's Edge Tool Panel
 
-The same list also sits in the Map's Edge Tool Panel, under **General > Groups**, so it can stay in one window with the other tools. It works the same way and adds a Refresh button, which reads the groups from the document again (through the hidden `groups_snapshot` extension). The menu's Browse Groups... still opens the list in a window of its own.
+The same list also sits in the Map's Edge Tool Panel, under **General > Groups**, so it can stay in one window with the other tools. It works the same way. The menu's Browse Groups... still opens the list in a window of its own.
+
+### Deleted objects
+
+The list does not see canvas edits as they happen, so an object deleted on the canvas can still show as a row for a while. Its row goes away when the list reads the document again: after any change made in the list (delete, remove, rename, drag, style), when the Refresh button is clicked (it runs the hidden `groups_snapshot` extension), or when Browse Groups... is chosen again while the window is open. Deleting or removing such a row always works, including a row in Stitch Order, which reads the document first.
 
 ## How it works
 
@@ -127,7 +148,8 @@ URI, not by prefix.
   Inkscape's own D-Bus Actions interface, the same actions Inkscape's menus
   call. Select, hide and lock use `select-by-id`, `object-set-property` and
   `selection-lock`. Rename, delete, remove, moving objects between groups
-  and the group order run the hidden `group_apply.py` extension, which the
+  the group order and the order of objects inside a group run the hidden
+  `group_apply.py` extension, which the
   panel tells what to change through a small JSON file. Changes to the
   stitch order run the Stitch Order extension's own actions (its hidden
   Reorder action for a drag). Edits land in Inkscape's in-memory document
@@ -153,10 +175,11 @@ URI, not by prefix.
 - **GTK 3, not Qt.** Inkscape is itself a GTK3 app, so its bundled Python
   already has GTK and the panel runs as an ordinary subprocess. Qt would
   not be available inside the Flatpak sandbox.
-- **The panel's list can drift** if something outside it changes the same
-  objects' group attribute while it is open, because there is no D-Bus
-  call to read attribute values back. Close and reopen Browse Groups to
-  re-scan the document. Changes made through Assign To Group are picked up
+- **The panel's list can fall behind** the document, because there is no
+  D-Bus call to read attribute values back. Instead the list reloads from
+  a snapshot of the document's groups that `group_apply.py` writes after
+  every change, and that Refresh and choosing Browse Groups again also
+  write. Changes made through Assign To Group are picked up
   automatically.
 - Verified on both the Flatpak and a native (apt) Inkscape install,
   Inkscape 1.2.2 through 1.4.4. The D-Bus mechanism is inherent to

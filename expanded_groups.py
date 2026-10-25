@@ -19,7 +19,8 @@ import sys
 import tempfile
 import time
 
-from expanded_groups_data import snapshot, PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH
+from expanded_groups_data import (snapshot, write_snapshot, PANEL_PID_PATH,
+                                  PANEL_FOCUS_REQUEST_PATH, EMBED_SNAPSHOT_PATH)
 
 VERSION = "2.4.0"
 
@@ -122,6 +123,12 @@ class ExpandedGroupsLauncher(inkex.EffectExtension):
 
     def effect(self):
         if panel_already_running():
+            # The open window reloads its list from this, so objects deleted
+            # since it opened drop out of it.
+            try:
+                write_snapshot(self.svg, EMBED_SNAPSHOT_PATH)
+            except OSError:
+                pass
             request_panel_focus()
             return
 

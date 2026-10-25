@@ -18,13 +18,16 @@ that one object's membership in its parent group. No nested groups
 
 Drag and drop: drag rows inside Stitch Order to change the sewing order;
 drag a group up or down to change the order groups are listed in; drag an
+object up or down inside its own group to change the order that group's
+objects are listed in (list order only, the drawing does not change); drag an
 object onto another group (or onto one of its objects) to move it there,
 or hold Ctrl while dropping to add it to that group and keep it in its
 own. Shift/Ctrl+click several rows of the same kind to drag them together.
 The new stitch order goes through Stitch Order's hidden Reorder action and
 group changes through this extension's hidden group_apply.py, both told
 what to do through a small file (ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH).
-The group order is saved on the root <svg> as trlo:group_order.
+The group order is saved on the root <svg> as trlo:group_order, and each
+group's object order as trlo:item_order (JSON {group name: [id, ...]}).
 
 This never touches the SVG file. It loads its starting model from the
 JSON snapshot expanded_groups.py wrote, and every mutation goes out live
@@ -35,11 +38,14 @@ and stay correctly tracked by undo/unsaved-changes - this script never
 writes to disk itself. Its own model is then updated optimistically to
 match, since there's no D-Bus query to read live attribute values back.
 
-Because of that, this window's list can drift out of sync with reality
-if something outside this tool changes the same objects' trlo:group
-attribute while it's open. There's no live "refresh from Inkscape"
-available (no D-Bus query mechanism for it) - closing and reopening the
-tool re-scans the document fresh.
+Because of that, the list can fall behind the document, for example
+when an object in a group is deleted on the canvas. It reads the document
+again (EMBED_SNAPSHOT_PATH) whenever that file changes: group_apply.py
+writes it after every group change, the Refresh button and choosing
+Browse Groups again while the window is open write it too. Rows of
+objects that are no longer in the document drop out then. Removing such a
+row from Stitch Order reads the document first, since Stitch Order's own
+Remove needs the object to exist.
 
 The first row, Stitch Order, is not a named group: it lists the objects
 numbered by the Stitch Order extension (stitch-order/), in sewing order.
@@ -68,13 +74,13 @@ GLib.set_prgname('org.inkscape.Inkscape')
 Gdk.set_program_class('Inkscape')
 
 from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_RECORD_PATH,
-                                   EMBED_SNAPSHOT_ACTION,
+                                   EMBED_SNAPSHOT_ACTION, EMBED_SNAPSHOT_PATH,
                                    ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH, STYLES_RECORD_PATH,
-                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names,
+                                   PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names, ordered_members,
                                    SELECTION_REPORT_PATH, SELECTION_REPORT_ACTION)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.17.0"
+VERSION = "3.19.2"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -87,6 +93,12 @@ COL_ICON, COL_NAME, COL_KIND, COL_ID, COL_EYE, COL_LOCK = range(6)
 # The Stitch Order row: kind "order", its object rows kind "order-object".
 # Its id can't clash with a group name typed by the user.
 ORDER_ROW_ID = "\x00stitch-order"
+# Lock icon colors: red when locked, green when unlocked. Dark enough to read
+# on a light theme and bright enough to read on a dark one.
+LOCK_COLORS = {"object-locked-symbolic": "#d32f2f", "object-unlocked-symbolic": "#2e7d32"}
+# Empty space after the last column, so the overlay scrollbar never covers
+# the eye and lock icons.
+RIGHT_MARGIN_PX = 16
 ORDER_ADD_ACTION = 'maps-edge.stitch-order-add.noprefs'
 ORDER_REMOVE_ACTION = 'maps-edge.stitch-order-remove.noprefs'
 ORDER_CLEAR_ACTION = 'maps-edge.stitch-order-clear.noprefs'
@@ -110,7 +122,8 @@ INTO = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
 class ExpandedGroupsPanel:
 
     def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=(),
-                 labels=None, host_window=None, status=None, snapshot_path=None, group_styles=None):
+                 labels=None, host_window=None, status=None, snapshot_path=None, group_styles=None,
+                 item_order=None):
         # host_window set: the list is built into another window (the Map's
         # Edge Tool Panel's Groups tab) instead of a window of its own. The
         # host owns the window, its focus and closing; status (a function)
@@ -118,11 +131,15 @@ class ExpandedGroupsPanel:
         # whenever snapshot_path changes (Refresh writes a new one).
         self.host_window = host_window
         self.status_cb = status
-        self.snapshot_path = snapshot_path
-        self.snapshot_mtime = self._mtime(snapshot_path) if snapshot_path else 0
+        # Both kinds of window reload when the document's groups are read again.
+        self.snapshot_path = snapshot_path or EMBED_SNAPSHOT_PATH
+        self.snapshot_mtime = self._mtime(self.snapshot_path)
         self.labels = dict(labels or {})  # {id: Inkscape label}; rows show the label, else the id
         self.inkscape_pid = inkscape_pid  # the window closes when this process ends
         self.group_order = list(group_order)  # names in dragged order; others follow, sorted
+        # {group name: [id, ...]}: each group's objects in dragged order;
+        # members not in it follow in document order (see group_members)
+        self.item_order = dict(item_order or {})
         self.by_name = by_name  # {group_name: [id, ...]}
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
@@ -172,7 +189,7 @@ class ExpandedGroupsPanel:
 
         toolbar = Gtk.Toolbar()
         assign_btn = Gtk.ToolButton()
-        assign_btn.set_icon_name("list-add")
+        self._set_toolbar_icon(assign_btn, "list-add-symbolic")
         assign_btn.set_label("Assign To Group...")
         assign_btn.set_is_important(True)
         assign_btn.set_tooltip_text("Assign the current canvas selection to a group (same as Extensions > Expanded Groups > Assign To Group)")
@@ -180,29 +197,28 @@ class ExpandedGroupsPanel:
         toolbar.insert(assign_btn, -1)
 
         rename_btn = Gtk.ToolButton()
-        rename_btn.set_icon_name("document-edit")
+        self._set_toolbar_icon(rename_btn, "document-edit-symbolic")
         rename_btn.set_tooltip_text("Rename selected group")
         rename_btn.connect("clicked", lambda b: self.start_rename_selected())
         toolbar.insert(rename_btn, -1)
 
         delete_btn = Gtk.ToolButton()
-        delete_btn.set_icon_name("edit-delete")
+        self._set_toolbar_icon(delete_btn, "edit-delete-symbolic")
         delete_btn.set_tooltip_text("Delete selected group, or remove selected object from its group")
         delete_btn.connect("clicked", lambda b: self.delete_selected())
         toolbar.insert(delete_btn, -1)
 
         highlight_btn = Gtk.ToolButton()
-        highlight_btn.set_icon_name("edit-find")
+        self._set_toolbar_icon(highlight_btn, "edit-find-symbolic")
         highlight_btn.set_tooltip_text("Highlight Selected: select the rows of the objects selected on the canvas")
         highlight_btn.connect("clicked", lambda b: self.highlight_canvas_selection())
         toolbar.insert(highlight_btn, -1)
 
-        if self.host_window is not None:
-            refresh_btn = Gtk.ToolButton()
-            refresh_btn.set_icon_name("view-refresh")
-            refresh_btn.set_tooltip_text("Read the groups from the document again")
-            refresh_btn.connect("clicked", lambda b: self.request_snapshot())
-            toolbar.insert(refresh_btn, -1)
+        refresh_btn = Gtk.ToolButton()
+        self._set_toolbar_icon(refresh_btn, "view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Read the groups from the document again")
+        refresh_btn.connect("clicked", lambda b: self.request_snapshot())
+        toolbar.insert(refresh_btn, -1)
         vbox.pack_start(toolbar, False, False, 0)
 
         self.store = Gtk.TreeStore(str, str, str, str, str, str)
@@ -212,7 +228,10 @@ class ExpandedGroupsPanel:
         col = Gtk.TreeViewColumn("Name")
         icon_renderer = Gtk.CellRendererPixbuf()
         col.pack_start(icon_renderer, False)
-        col.add_attribute(icon_renderer, "icon-name", COL_ICON)
+        # The model keeps the icon name; the cell draws that icon as a
+        # symbolic icon in the list's text color (selected text color on a
+        # selected row), so it stays readable whatever the icon theme draws.
+        col.set_cell_data_func(icon_renderer, self._name_icon_cell_data)
         self.text_renderer = Gtk.CellRendererText()
         self.text_renderer.connect("edited", self.on_name_edited)
         col.pack_start(self.text_renderer, True)
@@ -224,6 +243,10 @@ class ExpandedGroupsPanel:
         # Layers panel). Clicks are handled in on_button_press.
         self.eye_col = self._icon_column(COL_EYE)
         self.lock_col = self._icon_column(COL_LOCK)
+        spacer = Gtk.TreeViewColumn("")
+        spacer.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        spacer.set_fixed_width(RIGHT_MARGIN_PX)
+        self.tree.append_column(spacer)
 
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().set_select_function(lambda *args: not self.hold_selection)
@@ -257,18 +280,49 @@ class ExpandedGroupsPanel:
         else:
             self.show_status("Could not reach Inkscape to read the groups")
 
+    def read_snapshot(self, since=None):
+        """The document's groups from EMBED_SNAPSHOT_PATH, or None when the
+        file is missing, unreadable, or (with since) not newer than since."""
+        mtime = self._mtime(self.snapshot_path)
+        if since is not None and mtime == since:
+            return None
+        try:
+            with open(self.snapshot_path) as f:
+                snap = json.load(f)
+        except (OSError, ValueError):
+            return None
+        self.snapshot_mtime = mtime
+        return snap if isinstance(snap, dict) else None
+
+    def sync_from_document(self):
+        """Ask Inkscape for the document's groups and load them now. True
+        when a fresh read arrived."""
+        before = self._mtime(self.snapshot_path)
+        if not run_extension_live(EMBED_SNAPSHOT_ACTION):
+            return False
+        snap = self.read_snapshot(since=before)
+        if snap is None:
+            return False
+        self.load_snapshot(snap)
+        return True
+
     def load_snapshot(self, snap):
         """Replace the whole model with a fresh read of the document."""
         expanded = self._expanded_groups()
+        self.take_snapshot(snap)
+        self.refresh_tree()
+        self._restore_expanded(expanded)
+
+    def take_snapshot(self, snap):
+        """Replace the model (not the rows on screen) with a read of the document."""
         self.by_name = snap.get('by_name', {})
         self.by_id = snap.get('by_id', {})
         self.states = snap.get('states', {})
         self.stitch_order = list(snap.get('stitch_order', []))
         self.group_order = list(snap.get('group_order', []))
+        self.item_order = dict(snap.get('item_order', {}))
         self.group_styles = dict(snap.get('group_styles', {}))
         self.labels = dict(snap.get('labels', {}))
-        self.refresh_tree()
-        self._restore_expanded(expanded)
 
     def on_destroy(self, *args):
         try:
@@ -280,9 +334,116 @@ class ExpandedGroupsPanel:
     def _icon_column(self, model_col):
         renderer = Gtk.CellRendererPixbuf()
         column = Gtk.TreeViewColumn("", renderer)
-        column.add_attribute(renderer, "icon-name", model_col)
+        if model_col == COL_LOCK:
+            # Colored lock: the model keeps the icon name, the cell draws a
+            # tinted copy of that icon.
+            column.set_cell_data_func(renderer, self._lock_cell_data)
+        else:
+            column.add_attribute(renderer, "icon-name", model_col)
         self.tree.append_column(column)
         return column
+
+    def _set_toolbar_icon(self, button, name):
+        """Give a toolbar button the named symbolic icon, drawn in the same
+        color as the toolbar's text so it has the text's contrast on a light
+        or a dark theme (some icon themes draw these dim, faint or red).
+        Redrawn whenever the theme's colors change."""
+        self._tint_toolbar_icon(button, name)
+        button.connect("style-updated", lambda b: self._tint_toolbar_icon(b, name))
+
+    def _tint_toolbar_icon(self, button, name):
+        size = Gtk.icon_size_lookup(Gtk.IconSize.LARGE_TOOLBAR)[1]
+        scale = button.get_scale_factor()
+        color = button.get_style_context().get_color(button.get_state_flags())
+        key = (color.to_string(), scale)
+        if getattr(button, "_icon_key", None) == key:
+            return
+        theme = Gtk.IconTheme.get_for_screen(button.get_screen())
+        info = theme.lookup_icon_for_scale(name, size, scale, Gtk.IconLookupFlags.FORCE_SIZE)
+        if info is not None:
+            try:
+                pixbuf, _ = info.load_symbolic(color, None, None, None)
+                surface = Gdk.cairo_surface_create_from_pixbuf(pixbuf, scale, None)
+                image = Gtk.Image.new_from_surface(surface)
+                image.show()
+                button.set_icon_widget(image)
+                button._icon_key = key
+                return
+            except GLib.Error:
+                pass
+        button.set_icon_name(name)
+
+    def _name_icon_cell_data(self, column, renderer, model, it, data=None):
+        selected = self.tree.get_selection().iter_is_selected(it)
+        renderer.set_property("surface", self._name_icon_surface(model[it][COL_ICON], selected))
+
+    def _name_icon_surface(self, name, selected):
+        """The row's icon as a symbolic icon in the list's text color (or the
+        selected text color), cached per icon, color and screen scale.
+        Falls back to the theme's plain icon when it has no symbolic one.
+        The cache empties when the theme or its colors change."""
+        if not name:
+            return None
+        cache = getattr(self, "_name_icon_cache", None)
+        if cache is None:
+            cache = self._name_icon_cache = {}
+            theme = Gtk.IconTheme.get_for_screen(self.tree.get_screen())
+            theme.connect("changed", lambda t: cache.clear())
+            self.tree.connect("style-updated", lambda w: cache.clear())
+        ctx = self.tree.get_style_context()
+        ctx.save()
+        ctx.add_class("cell")
+        state = Gtk.StateFlags.SELECTED if selected else Gtk.StateFlags.NORMAL
+        if selected and self.tree.has_focus():
+            state |= Gtk.StateFlags.FOCUSED
+        color = ctx.get_color(state)
+        ctx.restore()
+        scale = self.tree.get_scale_factor()
+        key = (name, color.to_string(), scale)
+        if key not in cache:
+            surface = None
+            theme = Gtk.IconTheme.get_for_screen(self.tree.get_screen())
+            size = Gtk.icon_size_lookup(Gtk.IconSize.MENU)[1]
+            symbolic = name if name.endswith("-symbolic") else name + "-symbolic"
+            info = theme.choose_icon_for_scale([symbolic, name], size, scale,
+                                               Gtk.IconLookupFlags.FORCE_SIZE)
+            if info is not None:
+                try:
+                    pixbuf, _ = info.load_symbolic(color, None, None, None)
+                    surface = Gdk.cairo_surface_create_from_pixbuf(pixbuf, scale, None)
+                except GLib.Error:
+                    surface = None
+            cache[key] = surface
+        return cache[key]
+
+    def _lock_cell_data(self, column, renderer, model, it, data=None):
+        renderer.set_property("surface", self._lock_surface(model[it][COL_LOCK]))
+
+    def _lock_surface(self, name):
+        """The lock icon tinted with its LOCK_COLORS color, cached per icon
+        name and screen scale. None (an empty cell) if the theme lacks it."""
+        scale = self.tree.get_scale_factor()
+        cache = getattr(self, "_lock_cache", None)
+        if cache is None:
+            cache = self._lock_cache = {}
+            theme = Gtk.IconTheme.get_for_screen(self.tree.get_screen())
+            theme.connect("changed", lambda t: cache.clear())
+        key = (name, scale)
+        if key not in cache:
+            surface = None
+            theme = Gtk.IconTheme.get_for_screen(self.tree.get_screen())
+            size = Gtk.icon_size_lookup(Gtk.IconSize.MENU)[1]
+            info = theme.lookup_icon_for_scale(name, size, scale, Gtk.IconLookupFlags.FORCE_SIZE)
+            if info is not None:
+                color = Gdk.RGBA()
+                color.parse(LOCK_COLORS.get(name, "#808080"))
+                try:
+                    pixbuf, _ = info.load_symbolic(color, None, None, None)
+                    surface = Gdk.cairo_surface_create_from_pixbuf(pixbuf, scale, None)
+                except GLib.Error:
+                    surface = None
+            cache[key] = surface
+        return cache[key]
 
     def show_status(self, msg):
         if self.status_cb is not None:
@@ -343,20 +504,14 @@ class ExpandedGroupsPanel:
         return False
 
     def poll_assign(self):
-        if self.host_window is not None:
-            # Built into another window: that window handles Inkscape closing
-            # and focus requests. Reload when a new snapshot has been written.
-            if self.snapshot_path:
-                mtime = self._mtime(self.snapshot_path)
-                if mtime != self.snapshot_mtime:
-                    self.snapshot_mtime = mtime
-                    try:
-                        with open(self.snapshot_path) as f:
-                            self.load_snapshot(json.load(f))
-                        self.show_status(f"Groups: {len(self.by_name)}")
-                    except (OSError, ValueError):
-                        pass
-        elif self.inkscape_gone():
+        # Reload when the document's groups have been read again.
+        snap = self.read_snapshot(since=self.snapshot_mtime)
+        if snap is not None:
+            self.load_snapshot(snap)
+            self.show_status(f"Groups: {len(self.by_name)}")
+        # Built into another window: that window handles Inkscape closing
+        # and focus requests.
+        if self.host_window is None and self.inkscape_gone():
             self.window.destroy()
             return False
         # Also checked here (same 500ms tick) rather than a separate timer:
@@ -404,6 +559,12 @@ class ExpandedGroupsPanel:
                     rec = json.load(f)
                 name = rec['name']
                 self.labels.update(rec.get('labels', {}))
+                # Hidden/locked state of the added objects after the run
+                # (they may have taken on the group's state).
+                for node_id, st in (rec.get('states') or {}).items():
+                    if isinstance(st, dict):
+                        self.states[node_id] = {'hidden': bool(st.get('hidden')),
+                                                'locked': bool(st.get('locked'))}
                 for node_id in rec['ids']:
                     names = self.by_id.setdefault(node_id, [])
                     if name not in names:
@@ -438,7 +599,7 @@ class ExpandedGroupsPanel:
                                     self._eye_icon(self.state_of(node_id)['hidden']),
                                     self._lock_icon(self.state_of(node_id)['locked'])])
         for name in self.ordered_group_names():
-            members = self.by_name[name]
+            members = self.group_members(name)
             git = self.store.append(None, ["folder", name, "group", name,
                                            self._eye_icon(self.group_hidden(members)),
                                            self._lock_icon(self.group_locked(members))])
@@ -458,12 +619,17 @@ class ExpandedGroupsPanel:
         names = [n for n in dict.fromkeys(self.group_order) if n in self.by_name]
         return names + sorted(n for n in self.by_name if n not in names)
 
+    def group_members(self, name):
+        """A group's object ids in the order the list shows them: the
+        dragged order first, then the rest in document order."""
+        return ordered_members(self.by_name.get(name, []), self.item_order.get(name))
+
     # -- eye / lock state ---------------------------------------------------
 
     def members(self, kind, item_id):
         """The object ids a row stands for."""
         if kind == "group":
-            return list(self.by_name.get(item_id, []))
+            return self.group_members(item_id)
         if kind == "order":
             return list(self.stitch_order)
         return [item_id]
@@ -807,8 +973,13 @@ class ExpandedGroupsPanel:
         if old_name in self.group_order:
             self.group_order = [new_name if n == old_name else n for n in self.group_order]
         if not self.apply_groups(changes, with_order=True,
-                                 extra={'rename_style': [old_name, new_name]}):
+                                 extra={'rename_style': [old_name, new_name],
+                                        'rename_group': [old_name, new_name]}):
             return
+        if old_name in self.item_order:
+            moved = self.item_order.pop(old_name)
+            kept = self.item_order.get(new_name, [])
+            self.item_order[new_name] = kept + [i for i in moved if i not in kept]
         if old_name in self.group_styles:
             self.group_styles.setdefault(new_name, self.group_styles.pop(old_name))
         self.refresh_tree(renamed=(old_name, new_name))
@@ -849,10 +1020,15 @@ class ExpandedGroupsPanel:
                 remaining = merge_names(remaining, remove=name)
             changes[node_id] = remaining
         styled = [n for n in names if n in self.group_styles]
-        if not self.apply_groups(changes, extra={'drop_styles': styled} if styled else None):
+        extra = {'drop_groups': list(names)}
+        if styled:
+            extra['drop_styles'] = styled
+        if not self.apply_groups(changes, extra=extra):
             return
         for name in styled:
             self.group_styles.pop(name, None)
+        for name in names:
+            self.item_order.pop(name, None)
         self.refresh_tree()
         if len(names) == 1:
             self.show_status(f"Deleted “{names[0]}”")
@@ -863,7 +1039,8 @@ class ExpandedGroupsPanel:
         """Take each (object id, group name) membership away."""
         changes = {}
         for node_id, group_name in pairs:
-            changes[node_id] = merge_names(changes.get(node_id, self.by_id[node_id]), remove=group_name)
+            changes[node_id] = merge_names(changes.get(node_id, self.by_id.get(node_id, [])),
+                                           remove=group_name)
         if not self.apply_groups(changes):
             return
         expanded = self._expanded_groups()
@@ -881,6 +1058,16 @@ class ExpandedGroupsPanel:
             self.show_status("Adding selection to Stitch Order...")
 
     def remove_from_stitch_order(self, ids):
+        # Stitch Order's Remove acts on the canvas selection, so an object
+        # deleted since the list was read can't be selected and the removal
+        # would fail. Read the document first; rows of deleted objects go.
+        if self.sync_from_document():
+            gone = [i for i in ids if i not in self.stitch_order]
+            ids = [i for i in ids if i in self.stitch_order]
+            if not ids:
+                n = len(gone)
+                self.show_status(f"Removed {n} row(s) of object(s) no longer in the drawing")
+                return
         select_by_id_live(ids)
         time.sleep(LIVE_ACTION_PAUSE)
         if run_extension_live(ORDER_REMOVE_ACTION):
@@ -984,7 +1171,18 @@ class ExpandedGroupsPanel:
             top = Gtk.TreePath(dest[0][0])
             target = self.store[top][COL_ID]
             if all(parent == target for _, _, parent in rows):
-                return None
+                # Up or down inside its own group: change the list order.
+                if dest_kind != "object":
+                    return None
+                path = dest[0]
+                members = self.group_members(target)
+                at = path[1] if before else path[1] + 1
+                ids = {r[1] for r in rows}
+                moving = [i for i in members if i in ids]
+                rest = [i for i in members if i not in ids]
+                at -= sum(1 for i in members[:at] if i in ids)
+                return ("items", (target, rest[:at] + moving + rest[at:]), path,
+                        BEFORE if before else AFTER)
             return ("move", target, top, INTO)
         return None
 
@@ -1024,6 +1222,15 @@ class ExpandedGroupsPanel:
                 self.refresh_tree()
                 self._restore_expanded(expanded)
                 self.show_status("Group order changed")
+        elif what == "items":
+            name, ids = value
+            if ids != self.group_members(name):
+                if not self.apply_groups({}, extra={'item_order': {name: ids}}):
+                    return False
+                self.item_order[name] = list(ids)
+                self.refresh_tree()
+                self._restore_expanded(expanded)
+                self.show_status(f"Order of objects in “{name}” changed")
         elif what == "move":
             self.move_objects(rows, value, copy, expanded)
         return False
@@ -1062,7 +1269,14 @@ class ExpandedGroupsPanel:
             rec['order'] = self.ordered_group_names()
         with open(GROUP_APPLY_PENDING_PATH, 'w') as f:
             json.dump(rec, f)
+        before = self._mtime(self.snapshot_path)
         if run_extension_live(GROUP_APPLY_ACTION):
+            # group_apply.py leaves the document's groups after the change:
+            # take them as the model, so objects deleted on the canvas drop
+            # out. The caller redraws the rows.
+            snap = self.read_snapshot(since=before)
+            if snap is not None:
+                self.take_snapshot(snap)
             return True
         try:
             os.remove(GROUP_APPLY_PENDING_PATH)
@@ -1200,7 +1414,8 @@ def main():
     ExpandedGroupsPanel(snapshot.get('by_name', {}), snapshot.get('by_id', {}),
                         snapshot.get('states', {}), snapshot.get('stitch_order', []),
                         inkscape_pid, snapshot.get('group_order', []), snapshot.get('labels', {}),
-                        group_styles=snapshot.get('group_styles', {}))
+                        group_styles=snapshot.get('group_styles', {}),
+                        item_order=snapshot.get('item_order', {}))
     Gtk.main()
 
 

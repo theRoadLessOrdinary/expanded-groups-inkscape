@@ -10,7 +10,18 @@ D-Bus right after it writes GROUP_APPLY_PENDING_PATH:
              for the group and put it on every member
   reapply_style: group name - put the group's style on every member again
   clear_style: group name - forget the group's style (members keep theirs)
-An object that joins a styled group gets that group's style.
+  item_order: {group name: [object id, ...]} - the order the window lists
+              these groups' objects in (list order only, the drawing is
+              not touched); other groups keep the order they have
+  rename_group: [old, new] - a renamed group keeps its object order
+  drop_groups: [group name, ...] - deleted groups lose their object order
+An object that joins a styled group gets that group's style. An object
+that joins a group whose members are all hidden (or all locked) is hidden
+(or locked) too; a group with mixed members, or no members yet, changes
+nothing about the objects joining it.
+Ids of objects that are no longer in the document are skipped, and after
+each run the document's groups are written to EMBED_SNAPSHOT_PATH, so the
+windows drop rows of objects that were deleted on the canvas.
 Running as an effect makes each change one undo step, and inkex writes
 the trlo: attributes by namespace, whatever prefix the file uses.
 """
@@ -23,7 +34,9 @@ import time
 from expanded_groups_data import (GROUP_ORDER_ATTR, GROUP_APPLY_PENDING_PATH, GROUP_SEP,
                                   PENDING_MAX_AGE, STYLES_RECORD_PATH, set_group_names,
                                   get_group_names, get_group_styles, set_group_styles,
-                                  style_from, apply_style, scan_groups)
+                                  style_from, apply_style, scan_groups, scan_groups_by_id,
+                                  get_item_order, set_item_order, write_snapshot,
+                                  EMBED_SNAPSHOT_PATH, group_states, take_group_state)
 
 
 class GroupApply(inkex.EffectExtension):
@@ -50,6 +63,9 @@ class GroupApply(inkex.EffectExtension):
         for name in rec.get('drop_styles', []):
             styles.pop(name, None)
 
+        # Each group's hidden/locked state from its members before any
+        # change, keyed by the name it has after a rename.
+        states = {renamed.get(n, n): st for n, st in group_states(self.svg).items()}
         for node_id, names in rec.get('members', {}).items():
             node = self.svg.getElementById(node_id)
             if node is None:
@@ -57,8 +73,10 @@ class GroupApply(inkex.EffectExtension):
             had = {renamed.get(n, n) for n in get_group_names(node)}
             set_group_names(node, names)
             for name in names:
-                if name not in had and name in styles:
-                    apply_style(node, styles[name])
+                if name not in had:
+                    if name in styles:
+                        apply_style(node, styles[name])
+                    take_group_state(node, states.get(name))
 
         if 'order' in rec:
             names = [n for n in rec['order'] if n and GROUP_SEP not in n]
@@ -66,6 +84,8 @@ class GroupApply(inkex.EffectExtension):
                 self.svg.set(GROUP_ORDER_ATTR, GROUP_SEP.join(names))
             else:
                 self.svg.attrib.pop(GROUP_ORDER_ATTR, None)
+
+        self.update_item_order(rec)
 
         if rec.get('set_style'):
             name = rec['set_style']
@@ -86,6 +106,40 @@ class GroupApply(inkex.EffectExtension):
             set_group_styles(self.svg, styles)
             with open(STYLES_RECORD_PATH, 'w') as f:
                 json.dump({'styles': styles, 'time': time.time()}, f)
+
+        try:
+            write_snapshot(self.svg, EMBED_SNAPSHOT_PATH)
+        except OSError:
+            pass
+
+    def update_item_order(self, rec):
+        """Change the stored object order of groups as asked, then keep only
+        ids that are still members of their group, and only groups that
+        still exist."""
+        order = get_item_order(self.svg)
+        before = dict(order)
+        if rec.get('rename_group'):
+            old, new = rec['rename_group']
+            if old in order:
+                moved = order.pop(old)
+                order[new] = order.get(new, []) + [i for i in moved if i not in order.get(new, [])]
+        for name in rec.get('drop_groups', []):
+            order.pop(name, None)
+        for name, ids in (rec.get('item_order') or {}).items():
+            if isinstance(ids, list):
+                order[name] = [i for i in ids if isinstance(i, str)]
+        if not order and not before:
+            return
+        by_name, _ = scan_groups_by_id(self.svg)
+        kept = {}
+        for name, ids in order.items():
+            if name in by_name:
+                members = set(by_name[name])
+                ids = [i for i in dict.fromkeys(ids) if i in members]
+                if ids:
+                    kept[name] = ids
+        if kept != before:
+            set_item_order(self.svg, kept)
 
     def style_members(self, name, style):
         for node in scan_groups(self.svg).get(name, []):
