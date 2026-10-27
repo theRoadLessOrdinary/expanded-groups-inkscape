@@ -55,6 +55,11 @@ see its member objects as child rows.
 | Hide or show a whole group | Eye icon on the group row |
 | Lock or unlock a whole group | Lock icon on the group row |
 | Change the sewing order | Drag rows up or down inside Stitch Order |
+| Make a section in Stitch Order | Select object or section rows in Stitch Order, right-click, New Section from Selected Rows, then type its name |
+| Rename a section | Double-click it, or right-click, Rename Section |
+| Add the canvas selection to a section | Right-click the section, Add Selection to <name> |
+| Move a section or put an object in one | Drag it before, after or onto a section or object in Stitch Order |
+| Dissolve a section | Select it and press Delete, or right-click, Dissolve Section (its objects keep their numbers) |
 | Change the order groups are listed in | Drag a group row up or down |
 | Change the order objects are listed in inside a group | Drag an object row up or down inside its own group (the drawing order does not change) |
 | Move an object to another group | Drag its row onto the other group, or onto one of that group's objects |

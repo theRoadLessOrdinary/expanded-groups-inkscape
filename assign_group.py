@@ -38,10 +38,30 @@ from expanded_groups_data import (GROUP_SEP, LAST_ASSIGN_PATH, PENDING_MAX_AGE,
 from expanded_groups_dbus import quiet_stderr
 
 
+def expand_groups(nodes):
+    """The objects to assign, with each selected Inkscape group replaced by
+    the objects inside it, all the way down through nested groups, so each
+    object joins the Expanded Group on its own. Groups themselves are never
+    added. Each object appears once, in document order within a group."""
+    result = []
+
+    def visit(node):
+        if isinstance(node, inkex.Group):
+            for child in node:
+                if isinstance(child, inkex.ShapeElement):
+                    visit(child)
+        elif not any(node is n for n in result):
+            result.append(node)
+
+    for node in nodes:
+        visit(node)
+    return result
+
+
 class AssignGroup(inkex.EffectExtension):
 
     def effect(self):
-        selected = list(self.svg.selection)
+        selected = expand_groups(self.svg.selection)
         if not selected:
             inkex.errormsg("Select at least one object on the canvas first.")
             return

@@ -26,6 +26,8 @@ inkex.NSS['trlo'] = GROUP_NS
 GROUP_ATTR = inkex.addNS('group', 'trlo')
 # Set by the Stitch Order extension (stitch-order/); shown here as its own entry.
 ORDER_ATTR = inkex.addNS('stitch_order', 'trlo')
+# Stitch Order's section path for a numbered object (JSON list of names).
+SECTION_ATTR = inkex.addNS('stitch_section', 'trlo')
 # On the root <svg>: the order the window lists groups in (dragged by the
 # user), "|"-separated. Groups not in it are listed after, alphabetically.
 GROUP_ORDER_ATTR = inkex.addNS('group_order', 'trlo')
@@ -139,6 +141,20 @@ def scan_stitch_order(svg):
         except ValueError:
             pass
     return [node_id for _, _, node_id in sorted(numbered)]
+
+
+def scan_stitch_sections(svg):
+    """{id: [section, subsection, ...]} for numbered objects in a section."""
+    sections = {}
+    for node in svg.xpath('//*[@trlo:stitch_order and @trlo:stitch_section]', namespaces=inkex.NSS):
+        try:
+            path = json.loads(node.get(SECTION_ATTR))
+        except ValueError:
+            continue
+        if isinstance(path, list) and path and node.get('id'):
+            sections[node.get('id')] = [str(s) for s in path]
+    return sections
+
 
 
 def scan_labels(svg):
@@ -328,6 +344,7 @@ def snapshot(svg):
     by_name, by_id = scan_groups_by_id(svg)
     return {'by_name': by_name, 'by_id': by_id,
             'stitch_order': scan_stitch_order(svg),
+            'stitch_sections': scan_stitch_sections(svg),
             'group_order': scan_group_order(svg),
             'item_order': get_item_order(svg),
             'group_styles': get_group_styles(svg),
@@ -376,6 +393,9 @@ ORDER_RECORD_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_last.json'
 # The panel writes a dragged stitch order here, then runs Stitch Order's
 # hidden Reorder action, which reads it (same file name as stitch_order.py).
 ORDER_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_pending.json')
+# The panel's "Add Selection to <section>" names the section here for
+# Stitch Order's Add (same file name as stitch_order.py).
+ADD_SECTION_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'stitch_order_add_section.json')
 # Same handoff for group changes made in the panel (new group lists per
 # object, and the group order), read by group_apply.py.
 GROUP_APPLY_PENDING_PATH = os.path.join(tempfile.gettempdir(), 'expanded_groups_pending_apply.json')

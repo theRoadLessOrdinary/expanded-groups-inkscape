@@ -47,6 +47,12 @@ objects that are no longer in the document drop out then. Removing such a
 row from Stitch Order reads the document first, since Stitch Order's own
 Remove needs the object to exist.
 
+Stitch Order can hold sections: named blocks of the stitch order, nested as
+deep as wanted, for the user's own use (sewing ignores them). Each numbered
+object keeps its section path (trlo:stitch_section); Stitch Order keeps every
+section in one unbroken block. Sections are made from selected rows (New
+Section), renamed inline, dissolved (Delete), and dragged like objects.
+
 The first row, Stitch Order, is not a named group: it lists the objects
 numbered by the Stitch Order extension (stitch-order/), in sewing order.
 It selects, hides and locks like a group. Adding to it and removing from it
@@ -77,10 +83,10 @@ from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_R
                                    EMBED_SNAPSHOT_ACTION, EMBED_SNAPSHOT_PATH,
                                    ORDER_PENDING_PATH, GROUP_APPLY_PENDING_PATH, STYLES_RECORD_PATH,
                                    PANEL_PID_PATH, PANEL_FOCUS_REQUEST_PATH, merge_names, ordered_members,
-                                   SELECTION_REPORT_PATH, SELECTION_REPORT_ACTION)
+                                   SELECTION_REPORT_PATH, SELECTION_REPORT_ACTION, ADD_SECTION_PENDING_PATH)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.19.2"
+VERSION = "3.20.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -93,6 +99,9 @@ COL_ICON, COL_NAME, COL_KIND, COL_ID, COL_EYE, COL_LOCK = range(6)
 # The Stitch Order row: kind "order", its object rows kind "order-object".
 # Its id can't clash with a group name typed by the user.
 ORDER_ROW_ID = "\x00stitch-order"
+# A section row's id is its path as JSON, kind "section".
+SECTION_ICON = "format-indent-more"
+NEW_SECTION_NAME = "New Section"
 # Lock icon colors: red when locked, green when unlocked. Dark enough to read
 # on a light theme and bright enough to read on a dark one.
 LOCK_COLORS = {"object-locked-symbolic": "#d32f2f", "object-unlocked-symbolic": "#2e7d32"}
@@ -123,7 +132,7 @@ class ExpandedGroupsPanel:
 
     def __init__(self, by_name, by_id, states, stitch_order=(), inkscape_pid=None, group_order=(),
                  labels=None, host_window=None, status=None, snapshot_path=None, group_styles=None,
-                 item_order=None):
+                 item_order=None, stitch_sections=None):
         # host_window set: the list is built into another window (the Map's
         # Edge Tool Panel's Groups tab) instead of a window of its own. The
         # host owns the window, its focus and closing; status (a function)
@@ -144,6 +153,7 @@ class ExpandedGroupsPanel:
         self.by_id = by_id      # {id: [name, ...]}
         self.states = states    # {id: {'hidden': bool, 'locked': bool}}
         self.stitch_order = list(stitch_order)  # [id, ...] in sewing order
+        self.stitch_sections = dict(stitch_sections or {})  # {id: [section, ...]}
         self.group_styles = dict(group_styles or {})  # {group name: {property: value}}
         self.last_styles_mtime = self._mtime(STYLES_RECORD_PATH)
         self.last_assign_mtime = self._assign_mtime()
@@ -319,6 +329,7 @@ class ExpandedGroupsPanel:
         self.by_id = snap.get('by_id', {})
         self.states = snap.get('states', {})
         self.stitch_order = list(snap.get('stitch_order', []))
+        self.stitch_sections = dict(snap.get('stitch_sections', {}))
         self.group_order = list(snap.get('group_order', []))
         self.item_order = dict(snap.get('item_order', {}))
         self.group_styles = dict(snap.get('group_styles', {}))
@@ -531,6 +542,7 @@ class ExpandedGroupsPanel:
                 with open(ORDER_RECORD_PATH) as f:
                     rec = json.load(f)
                 self.stitch_order = list(rec['ids'])
+                self.stitch_sections = dict(rec.get('sections', {}))
                 self.labels.update(rec.get('labels', {}))
                 expanded = self._expanded_groups()
                 self.refresh_tree()
@@ -594,10 +606,23 @@ class ExpandedGroupsPanel:
         oit = self.store.append(None, ["format-list-ordered", "Stitch Order", "order", ORDER_ROW_ID,
                                        self._eye_icon(self.group_hidden(order)),
                                        self._lock_icon(self.group_locked(order))])
+        open_sections = []  # [(path, iter)] from the outermost down
         for n, node_id in enumerate(order, start=1):
-            self.store.append(oit, ["text-x-generic", f"{n}. {self.name_of(node_id)}", "order-object", node_id,
-                                    self._eye_icon(self.state_of(node_id)['hidden']),
-                                    self._lock_icon(self.state_of(node_id)['locked'])])
+            path = self.section_path(node_id)
+            while open_sections and path[:len(open_sections[-1][0])] != open_sections[-1][0]:
+                open_sections.pop()
+            for depth in range(len(open_sections), len(path)):
+                sub = path[:depth + 1]
+                ids = self.section_members(sub)
+                parent = open_sections[-1][1] if open_sections else oit
+                sit = self.store.append(parent, [SECTION_ICON, sub[-1], "section", json.dumps(sub),
+                                                 self._eye_icon(self.group_hidden(ids)),
+                                                 self._lock_icon(self.group_locked(ids))])
+                open_sections.append((sub, sit))
+            self.store.append(open_sections[-1][1] if open_sections else oit,
+                              ["text-x-generic", f"{n}. {self.name_of(node_id)}", "order-object", node_id,
+                               self._eye_icon(self.state_of(node_id)['hidden']),
+                               self._lock_icon(self.state_of(node_id)['locked'])])
         for name in self.ordered_group_names():
             members = self.group_members(name)
             git = self.store.append(None, ["folder", name, "group", name,
@@ -630,6 +655,8 @@ class ExpandedGroupsPanel:
         """The object ids a row stands for."""
         if kind == "group":
             return self.group_members(item_id)
+        if kind == "section":
+            return self.section_members(json.loads(item_id))
         if kind == "order":
             return list(self.stitch_order)
         return [item_id]
@@ -707,16 +734,26 @@ class ExpandedGroupsPanel:
         self.show_status(f"{verb} {len(other_ids)} object(s) other than {self.rows_label(rows)}")
 
     def _expanded_groups(self):
+        """Ids of the expanded rows, at any depth."""
         names = set()
-        for row in self.store:
-            if self.tree.row_expanded(row.path):
-                names.add(row[COL_ID])
+
+        def walk(it):
+            while it is not None:
+                if self.tree.row_expanded(self.store.get_path(it)):
+                    names.add(self.store[it][COL_ID])
+                    walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
         return names
 
     def _restore_expanded(self, names):
-        for row in self.store:
-            if row[COL_ID] in names:
-                self.tree.expand_row(row.path, False)
+        def walk(it):
+            while it is not None:
+                if self.store[it][COL_ID] in names:
+                    self.tree.expand_row(self.store.get_path(it), False)
+                    walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
 
     def rebuild_by_name(self):
         by_name = {}
@@ -781,12 +818,13 @@ class ExpandedGroupsPanel:
             for it in moved.get(key[:2], []):
                 selection.select_iter(it)
 
-    @staticmethod
-    def rows_label(rows):
+    def rows_label(self, rows):
         if len(rows) == 1:
             kind, item_id, _ = rows[0]
             if kind == "order":
                 return "“Stitch Order”"
+            if kind == "section":
+                return f"“{json.loads(item_id)[-1]}”"
             return f"“{item_id if kind == 'group' else self.name_of(item_id)}”"
         return f"the {len(rows)} selected rows"
 
@@ -831,20 +869,21 @@ class ExpandedGroupsPanel:
         selection.unselect_all()
         self.anchor_path = None
         found, first = set(), None
-        it = self.store.get_iter_first()
-        while it is not None:
-            child = self.store.iter_children(it)
-            while child is not None:
-                node_id = self.store[child][COL_ID]
-                if node_id in wanted:
-                    path = self.store.get_path(child)
+
+        def walk(it):
+            nonlocal first
+            while it is not None:
+                row = self.store[it]
+                if row[COL_KIND] in ("object", "order-object") and row[COL_ID] in wanted:
+                    path = self.store.get_path(it)
                     self.tree.expand_to_path(path)
-                    selection.select_iter(child)
-                    found.add(node_id)
+                    selection.select_iter(it)
+                    found.add(row[COL_ID])
                     if first is None:
                         first = path
-                child = self.store.iter_next(child)
-            it = self.store.iter_next(it)
+                walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
         if first is None:
             self.show_status("None of the selected objects is in a group or the Stitch Order")
             return
@@ -879,7 +918,7 @@ class ExpandedGroupsPanel:
                 self.toggle_state(kind, item_id, which, rows)
             return True
 
-        if event.type == Gdk.EventType._2BUTTON_PRESS and kind == "group":
+        if event.type == Gdk.EventType._2BUTTON_PRESS and kind in ("group", "section"):
             GLib.idle_add(self.start_rename, path)
             return False
 
@@ -933,10 +972,10 @@ class ExpandedGroupsPanel:
         selection.select_path(path)
         self.anchor_path = path.copy()
 
-        if kind in ("group", "order"):
+        if kind in ("group", "order", "section"):
             ids = self.members(kind, item_id)
             select_by_id_live(ids)
-            name = "Stitch Order" if kind == "order" else item_id
+            name = {"order": "Stitch Order", "section": self.store[it][COL_NAME]}.get(kind, item_id)
             self.show_status(f"Selected {len(ids)} object(s) in “{name}”")
         else:
             select_by_id_live([item_id])
@@ -949,14 +988,17 @@ class ExpandedGroupsPanel:
 
     def start_rename_selected(self):
         it = self._selected_iter()
-        if it is None or self.store[it][COL_KIND] != "group":
-            self.error("Select a group first.")
+        if it is None or self.store[it][COL_KIND] not in ("group", "section"):
+            self.error("Select a group or a Stitch Order section first.")
             return
         self.start_rename(self.store.get_path(it))
 
     def on_name_edited(self, renderer, path_str, new_text):
         renderer.set_property("editable", False)
         it = self.store.get_iter_from_string(path_str)
+        if self.store[it][COL_KIND] == "section":
+            self.rename_section(json.loads(self.store[it][COL_ID]), new_text.strip())
+            return
         if self.store[it][COL_KIND] != "group":
             return
         old_name = self.store[it][COL_ID]
@@ -997,12 +1039,15 @@ class ExpandedGroupsPanel:
             self.clear_stitch_order()
         elif kinds == {"order-object"}:
             self.remove_from_stitch_order([item_id for _, item_id, _ in rows])
+        elif kinds == {"section"}:
+            self.dissolve_sections([json.loads(item_id) for _, item_id, _ in rows])
         elif kinds == {"group"}:
             self.delete_groups([item_id for _, item_id, _ in rows])
         elif kinds == {"object"}:
             self.remove_objects([(item_id, parent) for _, item_id, parent in rows])
         else:
-            self.error("Select only groups, only objects in groups, or only objects in Stitch Order.")
+            self.error("Select only groups, only objects in groups, only objects in Stitch Order, "
+                       "or only Stitch Order sections.")
 
     def delete_groups(self, names):
         ids = {i for name in names for i in self.by_name.get(name, [])}
@@ -1084,6 +1129,151 @@ class ExpandedGroupsPanel:
         if run_extension_live(ORDER_CLEAR_ACTION):
             self.show_status("Clearing Stitch Order...")
 
+
+    # -- stitch order sections ----------------------------------------------
+
+    def section_path(self, node_id):
+        return list(self.stitch_sections.get(node_id, []))
+
+    def section_members(self, path):
+        """Ids in the section at path (and its subsections), in stitch order."""
+        return [i for i in self.stitch_order if self.section_path(i)[:len(path)] == path]
+
+    def grouped(self, ids, sections):
+        """ids in the same order, each section gathered into one block where
+        it first appears (the same rule stitch_order.py uses)."""
+        def arrange(items, depth):
+            keys, buckets = [], {}
+            for i in items:
+                path = sections.get(i, [])
+                key = ('section', path[depth]) if len(path) > depth else ('node', i)
+                if key not in buckets:
+                    buckets[key] = []
+                    keys.append(key)
+                buckets[key].append(i)
+            out = []
+            for key in keys:
+                out += arrange(buckets[key], depth + 1) if key[0] == 'section' else buckets[key]
+            return out
+        return arrange(list(ids), 0)
+
+    def order_units(self, rows):
+        """The selected Stitch Order rows as units to move or wrap: a section
+        (unless a selected section holds it) or an object (unless a selected
+        section holds it), in stitch order. Each unit is (ids, its parent
+        path): the ids' paths below that parent are kept when it moves."""
+        sections = [json.loads(i) for k, i, _ in rows if k == "section"]
+
+        def inside_selected(path):
+            return any(path[:len(s)] == s for s in sections)
+        units = []
+        for s in sections:
+            if not any(o != s and s[:len(o)] == o for o in sections):
+                units.append((self.section_members(s), s[:-1]))
+        for k, i, _ in rows:
+            if k == "order-object" and i in self.stitch_order and not inside_selected(self.section_path(i)):
+                units.append(([i], self.section_path(i)))
+        units = [u for u in units if u[0]]
+        units.sort(key=lambda u: self.stitch_order.index(u[0][0]))
+        return units
+
+    def moved_sections(self, units, new_parent):
+        """{id: new path} for every id in units, moved under new_parent."""
+        return {i: new_parent + self.section_path(i)[len(parent):]
+                for ids, parent in units for i in ids}
+
+    def order_with(self, sections_changed, ids=None):
+        """The stitch order (or ids) and the sections, with these changes,
+        sections gathered into blocks."""
+        sections = dict(self.stitch_sections)
+        sections.update(sections_changed)
+        sections = {i: p for i, p in sections.items() if p}
+        return self.grouped(ids if ids is not None else self.stitch_order, sections), sections
+
+    def new_section(self, rows):
+        """Wrap the selected Stitch Order rows in a new section, at the place
+        of the first one, then start renaming it."""
+        units = self.order_units(rows)
+        if not units:
+            self.show_status("Select objects or sections in Stitch Order first")
+            return
+        parent = units[0][1]
+        for _, p in units[1:]:
+            n = 0
+            while n < min(len(parent), len(p)) and parent[n] == p[n]:
+                n += 1
+            parent = parent[:n]
+        siblings = {self.section_path(i)[len(parent)] for i in self.stitch_order
+                    if self.section_path(i)[:len(parent)] == parent and len(self.section_path(i)) > len(parent)}
+        name, n = NEW_SECTION_NAME, 2
+        while name in siblings:
+            name, n = f"{NEW_SECTION_NAME} {n}", n + 1
+        new_path = parent + [name]
+        moving = [i for ids, _ in units for i in ids]
+        first = self.stitch_order.index(moving[0])
+        rest = [i for i in self.stitch_order if i not in moving]
+        at = first - sum(1 for i in self.stitch_order[:first] if i in moving)
+        changed = {i: new_path + self.section_path(i)[len(p):] for ids, p in units for i in ids}
+        ids, sections = self.order_with(changed, rest[:at] + moving + rest[at:])
+        if not self.set_stitch_order(ids, sections, expand=json.dumps(new_path)):
+            return
+        it = self.find_row("section", json.dumps(new_path))
+        if it is not None:
+            path = self.store.get_path(it)
+            self.tree.expand_to_path(path)
+            self.tree.get_selection().unselect_all()
+            self.tree.get_selection().select_path(path)
+            GLib.idle_add(self.start_rename, path)
+        self.show_status(f"New section with {len(moving)} object(s); type its name")
+
+    def rename_section(self, path, new_name):
+        if not new_name or new_name == path[-1]:
+            return
+        new_path = path[:-1] + [new_name]
+        changed = {i: new_path + self.section_path(i)[len(path):] for i in self.section_members(path)}
+        ids, sections = self.order_with(changed)
+        expanded = {json.dumps(new_path) if e == json.dumps(path) else e for e in self._expanded_groups()}
+        if self.set_stitch_order(ids, sections):
+            self._restore_expanded(expanded)
+            self.show_status(f"Renamed section “{path[-1]}” to “{new_name}”")
+
+    def dissolve_sections(self, paths):
+        """Take these sections away; their objects keep their place and
+        numbers, one level up."""
+        changed = {}
+        for path in sorted(paths, key=len, reverse=True):
+            for i in self.section_members(path):
+                cur = changed.get(i, self.section_path(i))
+                if cur[:len(path)] == path:
+                    changed[i] = path[:-1] + cur[len(path):]
+        ids, sections = self.order_with(changed)
+        if self.set_stitch_order(ids, sections):
+            what = f"“{paths[0][-1]}”" if len(paths) == 1 else f"{len(paths)} sections"
+            self.show_status(f"Dissolved {what}; its objects keep their numbers")
+
+    def add_selection_to_section(self, path):
+        with open(ADD_SECTION_PENDING_PATH, 'w') as f:
+            json.dump({'section': path, 'time': time.time()}, f)
+        if run_extension_live(ORDER_ADD_ACTION):
+            self.show_status(f"Adding selection to section “{path[-1]}”...")
+        else:
+            try:
+                os.remove(ADD_SECTION_PENDING_PATH)
+            except OSError:
+                pass
+
+    def find_row(self, kind, item_id):
+        def walk(it):
+            while it is not None:
+                if self.store[it][COL_KIND] == kind and self.store[it][COL_ID] == item_id:
+                    return it
+                found = walk(self.store.iter_children(it))
+                if found is not None:
+                    return found
+                it = self.store.iter_next(it)
+            return None
+        return walk(self.store.get_iter_first())
+
     # -- drag and drop -------------------------------------------------------
 
     def on_drag_begin(self, widget, context):
@@ -1125,6 +1315,8 @@ class ExpandedGroupsPanel:
         highlight path, highlight position), or None where they can't go."""
         rows = self.drag_rows
         kinds = {kind for kind, _, _ in rows}
+        if kinds <= {"order-object", "section"}:
+            kinds = {"order-object"}
         if len(kinds) != 1:
             return None
         kind = kinds.pop()
@@ -1132,24 +1324,14 @@ class ExpandedGroupsPanel:
         before = dest is not None and dest[1] in (BEFORE, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
         dest_kind = self.store[dest[0]][COL_KIND] if dest else None
 
-        if kind == "order-object":
-            if dest is None or dest_kind not in ("order", "order-object"):
-                return None
-            path = dest[0]
-            if dest_kind == "order":
-                at = 0 if before or self.tree.row_expanded(path) else len(self.stitch_order)
-            else:
-                at = path[1] if before else path[1] + 1
-            moving = [i for i in self.stitch_order if i in {r[1] for r in rows}]
-            rest = [i for i in self.stitch_order if i not in moving]
-            at -= sum(1 for i in self.stitch_order[:at] if i in moving)
-            return ("order", rest[:at] + moving + rest[at:], path, BEFORE if before else AFTER)
+        if kind in ("order-object", "section"):
+            return self.order_drop_plan(rows, dest)
 
         if kind == "group":
             names = self.ordered_group_names()
             if dest is None:
                 at, path, pos = len(names), Gtk.TreePath(len(names)), AFTER
-            elif dest_kind in ("order", "order-object"):
+            elif dest_kind in ("order", "order-object", "section"):
                 at, path, pos = 0, Gtk.TreePath(1), BEFORE
             else:
                 top = Gtk.TreePath(dest[0][0])
@@ -1186,6 +1368,51 @@ class ExpandedGroupsPanel:
             return ("move", target, top, INTO)
         return None
 
+    def order_drop_plan(self, rows, dest):
+        """Dropping Stitch Order objects and sections here: ("order", (ids,
+        sections), highlight path, highlight position), or None."""
+        if dest is None:
+            return None
+        path, pos = dest
+        dest_kind, dest_id = self.store[path][COL_KIND], self.store[path][COL_ID]
+        order = self.stitch_order
+        if dest_kind == "order":
+            parent = []
+            at = 0 if pos in (BEFORE, INTO) or self.tree.row_expanded(path) else len(order)
+            show = BEFORE if at == 0 else AFTER
+        elif dest_kind == "order-object":
+            parent = self.section_path(dest_id)
+            at = order.index(dest_id) + (0 if pos in (BEFORE, INTO) else 1)
+            show = BEFORE if pos in (BEFORE, INTO) else AFTER
+        elif dest_kind == "section":
+            sec = json.loads(dest_id)
+            members = self.section_members(sec)
+            if not members:
+                return None
+            first, last = order.index(members[0]), order.index(members[-1])
+            if pos == BEFORE:
+                parent, at, show = sec[:-1], first, BEFORE
+            elif pos == AFTER and not self.tree.row_expanded(path):
+                parent, at, show = sec[:-1], last + 1, AFTER
+            elif pos == AFTER:
+                parent, at, show = sec, first, AFTER          # first in the open section
+            else:
+                parent, at, show = sec, last + 1, Gtk.TreeViewDropPosition.INTO_OR_AFTER
+        else:
+            return None
+        units = self.order_units(rows)
+        if not units:
+            return None
+        for k, i, _ in rows:          # a section can't go inside itself
+            if k == "section" and parent[:len(json.loads(i))] == json.loads(i):
+                return None
+        moving = [i for ids, _ in units for i in ids]
+        rest = [i for i in order if i not in moving]
+        at -= sum(1 for i in order[:at] if i in moving)
+        ids, sections = self.order_with(self.moved_sections(units, parent), rest[:at] + moving + rest[at:])
+        return ("order", (ids, sections), path, show)
+
+
     def on_drag_motion(self, widget, context, x, y, time_):
         self.drag_y = y
         plan = self.drop_plan(x, y)
@@ -1212,8 +1439,9 @@ class ExpandedGroupsPanel:
         what, value = plan[0], plan[1]
         expanded = self._expanded_groups()
         if what == "order":
-            if value != self.stitch_order:
-                self.set_stitch_order(value)
+            ids, sections = value
+            if ids != self.stitch_order or sections != self.stitch_sections:
+                self.set_stitch_order(ids, sections)
         elif what == "groups":
             if value != self.ordered_group_names():
                 self.group_order = value
@@ -1235,21 +1463,30 @@ class ExpandedGroupsPanel:
             self.move_objects(rows, value, copy, expanded)
         return False
 
-    def set_stitch_order(self, ids):
+    def set_stitch_order(self, ids, sections=None, expand=None):
+        """Renumber in this order through Stitch Order's hidden Reorder
+        action; with sections ({id: path}), every object's section is set
+        too. expand: a row id to open after the redraw. True when sent."""
+        rec = {'ids': ids, 'time': time.time()}
+        if sections is not None:
+            rec['sections'] = {i: sections.get(i, []) for i in ids}
         with open(ORDER_PENDING_PATH, 'w') as f:
-            json.dump({'ids': ids, 'time': time.time()}, f)
+            json.dump(rec, f)
         if not run_extension_live(ORDER_REORDER_ACTION):
             try:
                 os.remove(ORDER_PENDING_PATH)
             except OSError:
                 pass
-            return
+            return False
         # The record Stitch Order leaves will confirm this; show it now.
-        expanded = self._expanded_groups()
+        expanded = self._expanded_groups() | ({expand} if expand else set())
         self.stitch_order = list(ids)
+        if sections is not None:
+            self.stitch_sections = {i: p for i, p in sections.items() if p}
         self.refresh_tree()
         self._restore_expanded(expanded)
         self.show_status("Stitch order changed")
+        return True
 
     def apply_groups(self, changes, with_order=False, extra=None):
         """Write new group lists ({id: [name, ...]}) and, if asked, the
@@ -1343,15 +1580,27 @@ class ExpandedGroupsPanel:
             item.connect("activate", lambda w: callback())
             menu.append(item)
 
-        if kinds <= {"order", "order-object"}:
+        if kinds <= {"order", "order-object", "section"}:
+            if single and kind == "section":
+                sec = json.loads(item_id)
+                add(f"Add Selection to “{sec[-1]}”", lambda: self.add_selection_to_section(sec))
             add("Add Selection to Stitch Order", self.add_selection_to_stitch_order)
             menu.append(Gtk.SeparatorMenuItem())
             if "order" in kinds:
                 add("Clear Stitch Order", self.clear_stitch_order)
             else:
-                ids = [i for _, i, _ in rows]
-                add("Remove from Stitch Order" if single else f"Remove {len(ids)} from Stitch Order",
-                    lambda: self.remove_from_stitch_order(ids))
+                add("New Section from Selected Rows", lambda: self.new_section(rows))
+                if single and kind == "section":
+                    add("Rename Section", lambda: self.start_rename(path))
+                if kinds == {"section"}:
+                    secs = [json.loads(i) for _, i, _ in rows]
+                    add("Dissolve Section" if single else f"Dissolve {len(secs)} Sections",
+                        lambda: self.dissolve_sections(secs))
+                ids = [i for k, i, _ in rows if k == "order-object"]
+                if ids and kinds == {"order-object"}:
+                    menu.append(Gtk.SeparatorMenuItem())
+                    add("Remove from Stitch Order" if single else f"Remove {len(ids)} from Stitch Order",
+                        lambda: self.remove_from_stitch_order(ids))
         elif kinds == {"group"}:
             if single:
                 add(f"Add Selection to “{item_id}”", lambda: self.assign_selection_to(item_id))
@@ -1415,7 +1664,8 @@ def main():
                         snapshot.get('states', {}), snapshot.get('stitch_order', []),
                         inkscape_pid, snapshot.get('group_order', []), snapshot.get('labels', {}),
                         group_styles=snapshot.get('group_styles', {}),
-                        item_order=snapshot.get('item_order', {}))
+                        item_order=snapshot.get('item_order', {}),
+                        stitch_sections=snapshot.get('stitch_sections', {}))
     Gtk.main()
 
 
