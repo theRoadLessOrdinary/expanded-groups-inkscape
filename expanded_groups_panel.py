@@ -1099,8 +1099,16 @@ class ExpandedGroupsPanel:
     # -- stitch order (runs the Stitch Order extension) -------------------
 
     def add_selection_to_stitch_order(self):
+        # At the end, not wherever the Add dialog was last set to.
+        with open(ADD_SECTION_PENDING_PATH, 'w') as f:
+            json.dump({'section': None, 'place': 'end', 'time': time.time()}, f)
         if run_extension_live(ORDER_ADD_ACTION):
             self.show_status("Adding selection to Stitch Order...")
+        else:
+            try:
+                os.remove(ADD_SECTION_PENDING_PATH)
+            except OSError:
+                pass
 
     def remove_from_stitch_order(self, ids):
         # Stitch Order's Remove acts on the canvas selection, so an object
@@ -1645,7 +1653,66 @@ class ExpandedGroupsPanel:
         if keyname in ("Delete", "BackSpace"):
             self.delete_selected()
             return True
+        if event.state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK):
+            return False
+        if keyname in ("Left", "KP_Left", "Right", "KP_Right", "Page_Up", "KP_Page_Up",
+                       "Page_Down", "KP_Page_Down"):
+            self.navigate(keyname.replace("KP_", ""))
+            return True
         return False
+
+    def navigate(self, key):
+        """Left: close an open row, else go to its parent. Right: open a
+        closed row. Page Down / Page Up: the next / previous visible group,
+        Stitch Order or section."""
+        path, _ = self.tree.get_cursor()
+        if path is None:
+            return
+        it = self.store.get_iter(path)
+        has_rows = self.store.iter_has_child(it)
+        if key == "Left":
+            if has_rows and self.tree.row_expanded(path):
+                self.tree.collapse_row(path)
+            elif path.get_depth() > 1:
+                parent = path.copy()
+                parent.up()
+                self.move_cursor_to(parent)
+        elif key == "Right":
+            if has_rows and not self.tree.row_expanded(path):
+                self.tree.expand_row(path, False)
+        else:
+            # Next / previous visible row that holds rows: a group, Stitch
+            # Order, or a section whose parent is open.
+            rows = self.visible_container_paths()
+            here = path.get_indices()
+            if key == "Page_Down":
+                after = [r for r in rows if r.get_indices() > here]
+                target = after[0] if after else None
+            else:
+                before = [r for r in rows if r.get_indices() < here]
+                target = before[-1] if before else None
+            if target is not None:
+                self.move_cursor_to(target)
+
+    def visible_container_paths(self):
+        """Paths of the visible rows that hold rows, top to bottom."""
+        out = []
+
+        def walk(it):
+            while it is not None:
+                path = self.store.get_path(it)
+                if self.store[it][COL_KIND] in ("group", "order", "section"):
+                    out.append(path)
+                if self.tree.row_expanded(path):
+                    walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        return out
+
+    def move_cursor_to(self, path):
+        self.tree.set_cursor(path, None, False)
+        self.tree.scroll_to_cell(path, None, False, 0, 0)
+        self.anchor_path = path.copy()
 
 
 def main():
