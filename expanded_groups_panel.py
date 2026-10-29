@@ -86,7 +86,7 @@ from expanded_groups_data import (LAST_ASSIGN_PATH, PENDING_TARGET_PATH, ORDER_R
                                    SELECTION_REPORT_PATH, SELECTION_REPORT_ACTION, ADD_SECTION_PENDING_PATH)
 from expanded_groups_dbus import select_by_id_live, run_extension_live, set_hidden_live, set_locked_live, quiet_stderr
 
-VERSION = "3.20.0"
+VERSION = "3.21.0"
 
 # Pause between a live D-Bus select and the extension run that acts on it.
 LIVE_ACTION_PAUSE = 0.05
@@ -594,6 +594,8 @@ class ExpandedGroupsPanel:
         """Rebuild the list from the model, keeping which rows are selected
         and expanded. renamed=(old, new) carries a renamed group's rows over."""
         selected = self.selected_rows() if len(self.store) else []
+        scroll = self.tree.get_vadjustment().get_value()
+        cursor = self._row_key(self.tree.get_cursor()[0])
         expanded = self._expanded_groups()
         if renamed:
             old, new = renamed
@@ -633,7 +635,40 @@ class ExpandedGroupsPanel:
                                         self._eye_icon(self.state_of(node_id)['hidden']),
                                         self._lock_icon(self.state_of(node_id)['locked'])])
         self._restore_expanded(expanded)
+        if renamed and cursor:
+            kind, cid, parent = cursor
+            cursor = (kind, new if (kind == "group" and cid == old) else cid,
+                      new if parent == old else parent)
+        path = self._find_row(cursor)
+        if path is not None:
+            self.tree.set_cursor(path, None, False)  # keeps keyboard focus on the same row
+        self.tree.get_selection().unselect_all()
         self.reselect(selected)
+        # put the list back where it was once GTK has laid out the new rows
+        GLib.idle_add(lambda: self.tree.get_vadjustment().set_value(scroll) and False)
+
+    def _row_key(self, path):
+        """(kind, id, parent id) of the row at path, or None."""
+        if path is None:
+            return None
+        it = self.store.get_iter(path)
+        parent = self.store.iter_parent(it)
+        row = self.store[it]
+        return (row[COL_KIND], row[COL_ID], self.store[parent][COL_ID] if parent else None)
+
+    def _find_row(self, key):
+        """Path of the row matching a _row_key, or None."""
+        if key is None:
+            return None
+        found = []
+
+        def visit(model, path, it):
+            if self._row_key(path) == key:
+                found.append(path.copy())
+                return True
+            return False
+        self.store.foreach(visit)
+        return found[0] if found else None
 
     def name_of(self, node_id):
         """What a row shows for an object: its label, or its id if it has none."""
@@ -1127,6 +1162,33 @@ class ExpandedGroupsPanel:
             what = self.name_of(ids[0]) if len(ids) == 1 else f"{len(ids)} objects"
             self.show_status(f"Removing {what} from Stitch Order...")
 
+    def reverse_ids(self, rows):
+        """The numbered objects the selected Stitch Order rows stand for,
+        in stitch order. The Stitch Order row itself means all of them."""
+        wanted = set()
+        for kind, item_id, _ in rows:
+            if kind in ("order", "order-object", "section"):
+                wanted.update(self.members(kind, item_id))
+        return [i for i in self.stitch_order if i in wanted]
+
+    def reverse_stitch_order(self, rows):
+        """Reverse the order of the selected objects among the numbers they
+        hold. Everything not selected keeps its number. Each object keeps
+        its own section, so sections are then gathered back into blocks
+        the same way Stitch Order does it."""
+        ids = self.reverse_ids(rows)
+        if len(ids) < 2:
+            return
+        chosen = set(ids)
+        slots = [n for n, i in enumerate(self.stitch_order) if i in chosen]
+        new = list(self.stitch_order)
+        for n, i in zip(slots, reversed(ids)):
+            new[n] = i
+        sections = {i: self.section_path(i) for i in new}
+        new = self.grouped(new, sections)
+        if self.set_stitch_order(new, sections):
+            self.show_status(f"Reversed the order of {len(ids)} objects")
+
     def clear_stitch_order(self):
         if not self.stitch_order:
             return
@@ -1594,6 +1656,11 @@ class ExpandedGroupsPanel:
                 add(f"Add Selection to “{sec[-1]}”", lambda: self.add_selection_to_section(sec))
             add("Add Selection to Stitch Order", self.add_selection_to_stitch_order)
             menu.append(Gtk.SeparatorMenuItem())
+            rev = self.reverse_ids(rows)
+            if len(rev) > 1:
+                add("Reverse Order" if "order" in kinds else f"Reverse Order of {len(rev)}",
+                    lambda: self.reverse_stitch_order(rows))
+                menu.append(Gtk.SeparatorMenuItem())
             if "order" in kinds:
                 add("Clear Stitch Order", self.clear_stitch_order)
             else:
